@@ -5,6 +5,7 @@ from typing import List, Optional
 import logging
 
 from app.services.ml_service import MLService
+from app.services.alert_service import AlertService
 from app.ml.models.registry import is_model_trained, get_model
 
 logger = logging.getLogger(__name__)
@@ -70,7 +71,20 @@ class SignalService:
             logger.info(
                 f"✅ Signal stored: {ticker} → {result['action']} @ {result.get('entry_time')}"
             )
-            return doc
+
+        # Fire alert for high-confidence directional signals
+        try:
+            alert_svc = AlertService(self.pool)
+            await alert_svc.maybe_create(
+                ticker=ticker,
+                action=result["action"],
+                confidence=result["confidence"],
+                signal_id=doc["id"],
+            )
+        except Exception as e:
+            logger.warning(f"⚠️  Alert creation failed for {ticker}: {e}")
+
+        return doc
 
     async def generate_signal(self, ticker: str, interval: str = "1d") -> dict:
         ticker = ticker.upper()

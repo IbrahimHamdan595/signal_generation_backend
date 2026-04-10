@@ -3,10 +3,17 @@ import pandas as pd
 import ta
 import numpy as np
 import asyncpg
-from datetime import datetime, timezone
-from typing import List, Tuple
+import httpx
+from datetime import datetime, date, timezone, timedelta
+from typing import List, Tuple, Optional
 import logging
 import time
+
+# ── Module-level caches (shared across all OHLCVService instances) ────────────
+# VIX: keyed by period string → (Series, fetched_date)
+_VIX_CACHE: dict[str, tuple[pd.Series, date]] = {}
+# CBOE equity put/call: single cache entry → (Series, fetched_date)
+_PUTCALL_CACHE: Optional[tuple[pd.Series, date]] = None
 
 logger = logging.getLogger(__name__)
 
@@ -102,7 +109,14 @@ class OHLCVService:
         if df.empty:
             raise ValueError(f"DataFrame empty after cleaning for {ticker}")
 
-        indicators_df = self._compute_indicators(df)
+        # ── Fetch real external data to replace stubs ─────────────────────────
+        vix_series      = self._fetch_vix_series(period)
+        earnings_dates  = self._fetch_earnings_dates(ticker)
+        putcall_series  = self._fetch_putcall_series()
+
+        indicators_df = self._compute_indicators(
+            df, vix_series, earnings_dates, putcall_series
+        )
 
         async with self.pool.acquire() as conn:
             for _, row in df.iterrows():
@@ -241,7 +255,83 @@ class OHLCVService:
 
         return len(df)
 
-    def _compute_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+    # ── External data fetchers ────────────────────────────────────────────────
+
+    def _fetch_vix_series(self, period: str) -> pd.Series:
+        """Download ^VIX history. Returns a date-normalised Series (date → close)."""
+        global _VIX_CACHE
+        today = date.today()
+        cached = _VIX_CACHE.get(period)
+        if cached and cached[1] == today:
+            return cached[0]
+        try:
+            raw = yf.download("^VIX", period=period, interval="1d",
+                              progress=False, auto_adjust=True)
+            if raw.empty:
+                return pd.Series(dtype=float)
+            close = raw["Close"]
+            # yfinance sometimes returns a MultiIndex column
+            if hasattr(close, "columns"):
+                close = close.iloc[:, 0]
+            close.index = pd.to_datetime(close.index).normalize()
+            _VIX_CACHE[period] = (close, today)
+            logger.info(f"✅ VIX: loaded {len(close)} bars")
+            return close
+        except Exception as e:
+            logger.warning(f"⚠️  VIX fetch failed: {e}")
+            return pd.Series(dtype=float)
+
+    def _fetch_earnings_dates(self, ticker: str) -> pd.DatetimeIndex:
+        """Return normalised DatetimeIndex of all known earnings dates for ticker."""
+        try:
+            t = yf.Ticker(ticker)
+            ed = t.earnings_dates
+            if ed is None or ed.empty:
+                return pd.DatetimeIndex([])
+            idx = pd.to_datetime(ed.index).normalize().sort_values()
+            logger.info(f"✅ Earnings for {ticker}: {len(idx)} dates")
+            return idx
+        except Exception as e:
+            logger.warning(f"⚠️  Earnings fetch failed for {ticker}: {e}")
+            return pd.DatetimeIndex([])
+
+    def _fetch_putcall_series(self) -> pd.Series:
+        """
+        Download CBOE equity put/call ratio history (public CSV).
+        Returns a date-indexed Series (date → ratio).
+        Cached for the day.
+        """
+        global _PUTCALL_CACHE
+        today = date.today()
+        if _PUTCALL_CACHE and _PUTCALL_CACHE[1] == today:
+            return _PUTCALL_CACHE[0]
+        url = "https://cdn.cboe.com/api/global/us_indices/daily_prices/EQPC_History.csv"
+        try:
+            resp = httpx.get(url, timeout=15, follow_redirects=True)
+            resp.raise_for_status()
+            from io import StringIO
+            # CBOE CSV has a header row then: Date, EQPC
+            df = pd.read_csv(StringIO(resp.text), skiprows=1, names=["date", "pc"])
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+            df = df.dropna(subset=["date"])
+            series = df.set_index("date")["pc"].astype(float)
+            series.index = series.index.normalize()
+            _PUTCALL_CACHE = (series, today)
+            logger.info(f"✅ CBOE put/call: loaded {len(series)} days")
+            return series
+        except Exception as e:
+            logger.warning(f"⚠️  CBOE put/call fetch failed: {e}")
+            return pd.Series(dtype=float)
+
+    # ── Indicator computation ─────────────────────────────────────────────────
+
+    def _compute_indicators(
+        self,
+        df: pd.DataFrame,
+        vix_series: pd.Series = None,
+        earnings_dates: pd.DatetimeIndex = None,
+        putcall_series: pd.Series = None,
+    ) -> pd.DataFrame:
         out = df[["timestamp"]].copy()
         close = df["close"]
         high = df["high"]
@@ -328,11 +418,43 @@ class OHLCVService:
             volume > ta.trend.sma_indicator(volume, window=20)
         ).astype(int)
 
-        out["vix_level"] = 20.0
-        out["vix_change"] = 0.0
-        out["earnings_days"] = 30
+        # ── VIX ───────────────────────────────────────────────────────────────
+        bar_dates = pd.to_datetime(df["timestamp"]).dt.normalize()
+        if vix_series is not None and not vix_series.empty:
+            mapped = bar_dates.map(vix_series)
+            # Forward-fill gaps (weekends/holidays) up to 5 days
+            mapped = mapped.fillna(method="ffill", limit=5).fillna(20.0)
+            out["vix_level"] = mapped.values
+            out["vix_change"] = (
+                pd.Series(out["vix_level"]).pct_change().fillna(0.0) * 100
+            ).values
+        else:
+            out["vix_level"]  = 20.0
+            out["vix_change"] = 0.0
+
+        # ── Days to next earnings ─────────────────────────────────────────────
+        if earnings_dates is not None and len(earnings_dates) > 0:
+            def _days_to_next(dt: pd.Timestamp) -> int:
+                future = earnings_dates[earnings_dates >= dt]
+                if len(future) == 0:
+                    return 90   # no known upcoming date → neutral value
+                return int((future[0] - dt).days)
+            out["earnings_days"] = bar_dates.apply(_days_to_next).values
+        else:
+            out["earnings_days"] = 30
+
+        # social_sentiment is populated later by Alpha Vantage pipeline;
+        # keep a neutral default here so the column exists in every row.
         out["social_sentiment"] = 0.0
-        out["options_put_call_ratio"] = 1.0
+
+        # ── CBOE equity put/call ratio ────────────────────────────────────────
+        if putcall_series is not None and not putcall_series.empty:
+            mapped_pc = bar_dates.map(putcall_series)
+            out["options_put_call_ratio"] = (
+                mapped_pc.fillna(method="ffill", limit=5).fillna(1.0).values
+            )
+        else:
+            out["options_put_call_ratio"] = 1.0
 
         return out
 

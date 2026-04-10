@@ -1,8 +1,12 @@
-from fastapi import APIRouter, HTTPException, Depends, Query, BackgroundTasks
+from fastapi import APIRouter, HTTPException, Depends, Query, BackgroundTasks, Request
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 from typing import List
 from pydantic import BaseModel
 
 from app.core.security import get_current_active_user
+
+limiter = Limiter(key_func=get_remote_address)
 from app.db.database import get_db
 from app.services.signal_service import SignalService
 from app.services.ticker_list_service import ticker_list_service
@@ -61,7 +65,9 @@ async def list_signals(
 
 
 @router.post("/generate", response_model=SignalResponse)
+@limiter.limit("30/minute")
 async def generate_signal(
+    request: Request,
     body: SignalGenerateRequest,
     pool=Depends(get_db),
     current_user=Depends(get_current_active_user),
@@ -189,3 +195,70 @@ async def get_ticker_list(
 ):
     tickers = await ticker_list_service.get_tickers()
     return {"tickers": tickers, "count": len(tickers)}
+
+
+@router.get("/{signal_id}/explain")
+async def explain_signal(
+    signal_id: int,
+    pool=Depends(get_db),
+    current_user=Depends(get_current_active_user),
+):
+    """
+    Return gradient-based feature importance for a stored signal.
+    Shows which price/indicator features most influenced the model's decision.
+    """
+    from app.ml.models.registry import get_model, load_scaler_params
+    from app.ml.data.dataset import DatasetBuilder, FEATURE_COLS, SEQUENCE_LEN
+    import torch, numpy as np
+
+    # Load the signal from DB
+    async with pool.acquire() as conn:
+        sig = await conn.fetchrow("SELECT * FROM signals WHERE id = $1", signal_id)
+    if not sig:
+        raise HTTPException(404, "Signal not found")
+
+    model = get_model()
+    if model is None:
+        raise HTTPException(400, "Model not trained")
+
+    ticker, interval = sig["ticker"], sig["interval"]
+    builder = DatasetBuilder(pool)
+    X_price, X_sent, _, _, _ = await builder.build([ticker], interval, sequence_len=SEQUENCE_LEN)
+    if X_price is None or len(X_price) == 0:
+        raise HTTPException(404, "No feature data available for this signal")
+
+    scaler = load_scaler_params()
+    if scaler:
+        ts = scaler.get(ticker.upper()) or scaler.get(ticker)
+        if ts:
+            X_price = (X_price - np.array(ts["mean"])) / (np.array(ts["std"]) + 1e-8)
+
+    device = next(model.parameters()).device
+    x_p = torch.tensor(X_price[-1:], dtype=torch.float32, requires_grad=True).to(device)
+    x_s = torch.tensor(X_sent[-1:], dtype=torch.float32).to(device)
+
+    model.eval()
+    out = model(x_p, x_s)
+    class_logits = out[0]
+    pred_class = int(class_logits.argmax(dim=1).item())
+    class_logits[0, pred_class].backward()
+
+    # Average absolute gradient across time dimension → per-feature importance
+    grads = x_p.grad.abs().mean(dim=1).squeeze().cpu().numpy()
+    total = float(grads.sum()) or 1.0
+    importances = {
+        col: round(float(grads[i]) / total, 4)
+        for i, col in enumerate(FEATURE_COLS)
+        if i < len(grads)
+    }
+    # Sort descending
+    importances = dict(sorted(importances.items(), key=lambda kv: kv[1], reverse=True))
+    top = dict(list(importances.items())[:15])
+
+    return {
+        "signal_id": signal_id,
+        "ticker": ticker,
+        "action": sig["action"],
+        "top_features": top,
+        "all_features": importances,
+    }

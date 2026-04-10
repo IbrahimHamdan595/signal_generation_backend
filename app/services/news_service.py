@@ -3,13 +3,14 @@ import json
 import httpx
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-NEWSAPI_BASE = "https://newsapi.org/v2/everything"
+NEWSAPI_BASE       = "https://newsapi.org/v2/everything"
+ALPHAVANTAGE_BASE  = "https://www.alphavantage.co/query"
 
 # Cache so we only fetch the S&P 500 list once per server run
 _SP500_MAP: Dict[str, str] = {}
@@ -656,3 +657,168 @@ class NewsService:
             "source": raw.get("source", {}).get("name") or "Unknown",
             "published_at": published_at,
         }
+
+
+# ── Alpha Vantage News + Sentiment ───────────────────────────────────────────
+
+class AlphaVantageNewsService:
+    """
+    Uses the Alpha Vantage NEWS_SENTIMENT endpoint.
+
+    Free tier: 25 calls/day.
+    Each call returns up to 200 articles with pre-computed sentiment scores
+    (no FinBERT needed for these).
+
+    Historical range:  supply time_from / time_to (format: YYYYMMDDTHHMM).
+    Recent articles:   omit time_from / time_to.
+    """
+
+    # AV sentiment label → our canonical label
+    _LABEL_MAP = {
+        "Bullish":          "positive",
+        "Somewhat-Bullish": "positive",
+        "Neutral":          "neutral",
+        "Somewhat-Bearish": "negative",
+        "Bearish":          "negative",
+    }
+
+    def __init__(self):
+        self.api_key = settings.ALPHAVANTAGE_KEY
+
+    def is_configured(self) -> bool:
+        return bool(self.api_key)
+
+    async def fetch_articles(
+        self,
+        ticker: str,
+        time_from: Optional[str] = None,
+        time_to:   Optional[str] = None,
+        limit:     int = 50,
+    ) -> List[Dict]:
+        """
+        Fetch articles from Alpha Vantage for *ticker*.
+
+        Args:
+            ticker:    e.g. "AAPL"
+            time_from: "YYYYMMDDTHHMM"  (e.g. "20220101T0000")
+            time_to:   "YYYYMMDDTHHMM"
+            limit:     max articles to return (AV max = 200 per call)
+
+        Returns a list of normalised article dicts ready for the DB.
+        """
+        if not self.api_key:
+            raise ValueError("ALPHAVANTAGE_KEY is not set in .env")
+
+        params: Dict = {
+            "function": "NEWS_SENTIMENT",
+            "tickers":  ticker.upper(),
+            "limit":    min(limit, 200),
+            "apikey":   self.api_key,
+            "sort":     "LATEST",
+        }
+        if time_from:
+            params["time_from"] = time_from
+        if time_to:
+            params["time_to"] = time_to
+
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.get(ALPHAVANTAGE_BASE, params=params)
+
+        if resp.status_code != 200:
+            raise ValueError(f"Alpha Vantage API error {resp.status_code}: {resp.text[:200]}")
+
+        data = resp.json()
+
+        # AV returns {"Information": "..."} when rate-limited or key invalid
+        if "Information" in data:
+            raise ValueError(f"Alpha Vantage rate-limit / key error: {data['Information']}")
+        if "Error Message" in data:
+            raise ValueError(f"Alpha Vantage error: {data['Error Message']}")
+
+        feed = data.get("feed", [])
+        logger.info(f"📰 AV {ticker}: {len(feed)} articles fetched")
+        return [self._parse(article, ticker) for article in feed]
+
+    def _parse(self, raw: Dict, ticker: str) -> Dict:
+        """
+        Convert a raw Alpha Vantage article to our internal format,
+        including pre-computed sentiment scores.
+        """
+        # Parse timestamp: "20231015T143000"
+        ts_raw = raw.get("time_published", "")
+        try:
+            published_at = datetime.strptime(ts_raw, "%Y%m%dT%H%M%S")
+        except ValueError:
+            try:
+                published_at = datetime.strptime(ts_raw[:15], "%Y%m%dT%H%M%S")
+            except Exception:
+                published_at = datetime.now(timezone.utc).replace(tzinfo=None)
+
+        # Find ticker-specific sentiment (prefer over overall)
+        ticker_upper = ticker.upper()
+        ts_list = raw.get("ticker_sentiment", [])
+        ts_entry = next(
+            (t for t in ts_list if t.get("ticker", "").upper() == ticker_upper),
+            None,
+        )
+
+        if ts_entry:
+            score = float(ts_entry.get("ticker_sentiment_score", 0.0))
+            label_raw = ts_entry.get("ticker_sentiment_label", "Neutral")
+        else:
+            score = float(raw.get("overall_sentiment_score", 0.0))
+            label_raw = raw.get("overall_sentiment_label", "Neutral")
+
+        label = self._LABEL_MAP.get(label_raw, "neutral")
+
+        # Derive pos / neg / neutral scores from compound score (-1 → +1)
+        pos = max(0.0, score)
+        neg = max(0.0, -score)
+        neu = round(1.0 - abs(score), 6)
+
+        return {
+            "ticker":          ticker_upper,
+            "title":           raw.get("title") or "",
+            "description":     raw.get("summary") or "",
+            "url":             raw.get("url") or "",
+            "source":          raw.get("source") or "Unknown",
+            "published_at":    published_at,
+            # Pre-computed sentiment — no FinBERT call needed
+            "sentiment_label": label,
+            "positive_score":  round(pos, 6),
+            "negative_score":  round(neg, 6),
+            "neutral_score":   round(neu, 6),
+            "compound_score":  round(score, 6),
+        }
+
+    async def fetch_daily_sentiment_series(
+        self,
+        ticker: str,
+        period_years: int = 2,
+    ) -> Dict[str, float]:
+        """
+        Fetch enough historical articles to build a daily compound-score series.
+        Returns {date_str: avg_compound_score} for each day that had articles.
+
+        With AV free tier (25 calls/day) we fetch 2 calls per ticker:
+          • last year
+          • year before that
+        This gives ~2 years of history.
+        """
+        results: Dict[str, List[float]] = {}
+        now = datetime.now(timezone.utc)
+
+        for yr_offset in range(period_years):
+            t_end   = now - timedelta(days=365 * yr_offset)
+            t_start = t_end - timedelta(days=365)
+            tf = t_start.strftime("%Y%m%dT%H%M")
+            tt = t_end.strftime("%Y%m%dT%H%M")
+            try:
+                articles = await self.fetch_articles(ticker, time_from=tf, time_to=tt, limit=200)
+                for a in articles:
+                    day = a["published_at"].strftime("%Y-%m-%d")
+                    results.setdefault(day, []).append(a["compound_score"])
+            except Exception as e:
+                logger.warning(f"AV historical fetch failed ({ticker} yr-{yr_offset}): {e}")
+
+        return {day: sum(scores) / len(scores) for day, scores in results.items()}

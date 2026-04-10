@@ -140,13 +140,23 @@ class DatasetBuilder:
         interval: str = "1d",
         sequence_len: int = SEQUENCE_LEN,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict]:
+        """
+        Build the full dataset with per-ticker Z-score normalisation.
+        Each ticker gets its own mean/std computed on its own sequences only,
+        preventing price-level contamination between different stocks.
+        scaler_params is a dict  ticker → {mean: [...], std: [...]}.
+        """
         all_price, all_sent, all_cls, all_reg = [], [], [], []
+        scaler_params: dict = {}
 
         for ticker in tickers:
             try:
                 p, s, c, r = await self._build_ticker(ticker, interval, sequence_len)
                 if p is not None and len(p) > 0:
-                    all_price.append(p)
+                    # ── Per-ticker normalisation ──────────────────────────────
+                    p_norm, t_scaler = self._normalise(p)
+                    scaler_params[ticker] = t_scaler
+                    all_price.append(p_norm)
                     all_sent.append(s)
                     all_cls.append(c)
                     all_reg.append(r)
@@ -161,8 +171,6 @@ class DatasetBuilder:
         X_sentiment = np.concatenate(all_sent, axis=0).astype(np.float32)
         y_class = np.concatenate(all_cls, axis=0).astype(np.int64)
         y_regression = np.concatenate(all_reg, axis=0).astype(np.float32)
-
-        X_price, scaler_params = self._normalise(X_price)
 
         logger.info(
             f"✅ Dataset: {X_price.shape[0]} sequences | "
@@ -185,7 +193,7 @@ class DatasetBuilder:
                 interval,
             )
 
-        if len(ohlcv_rows) < sequence_len + 2:
+        if len(ohlcv_rows) < sequence_len + settings.LOOKAHEAD_WINDOW + 1:
             logger.warning(f"⚠️  {ticker}: not enough rows ({len(ohlcv_rows)})")
             return None, None, None, None
 
@@ -233,45 +241,101 @@ class DatasetBuilder:
         df = df.sort_values("timestamp").reset_index(drop=True)
         df[FEATURE_COLS] = df[FEATURE_COLS].ffill().bfill()
 
-        if sent_row:
-            sent_vec = np.array(
-                [
-                    sent_row.get("avg_positive", 0.0),
-                    sent_row.get("avg_negative", 0.0),
-                    sent_row.get("avg_neutral", 1.0),
-                    sent_row.get("avg_compound", 0.0),
-                ],
-                dtype=np.float32,
-            )
-        else:
-            sent_vec = np.array([0.0, 0.0, 1.0, 0.0], dtype=np.float32)
+        # ── Build per-bar sentiment vector ────────────────────────────────────
+        # Priority order:
+        #  1. social_sentiment column (AV compound score per bar) — most accurate
+        #  2. Interpolated from the global snapshot — coarse fallback
+        #  3. Neutral zeros — last resort
 
-        prices = df[FEATURE_COLS].values
-        closes = df["close"].values
+        social_col = "social_sentiment"
+        has_social = (
+            social_col in df.columns
+            and df[social_col].notna().any()
+            and (df[social_col] != 0.0).any()
+        )
+
+        if has_social:
+            # Forward-fill then back-fill so every bar has a value
+            social_series = df[social_col].ffill().bfill().fillna(0.0)
+        else:
+            social_series = pd.Series(0.0, index=df.index)
+
+        if sent_row:
+            global_pos = float(sent_row.get("avg_positive", 0.0))
+            global_neg = float(sent_row.get("avg_negative", 0.0))
+            global_neu = float(sent_row.get("avg_neutral",  1.0))
+            global_cmp = float(sent_row.get("avg_compound", 0.0))
+        else:
+            global_pos, global_neg, global_neu, global_cmp = 0.0, 0.0, 1.0, 0.0
+
+        prices     = df[FEATURE_COLS].values
+        closes     = df["close"].values
         timestamps = df["timestamp"].values
-        atrs = df["atr_14"].values if "atr_14" in df.columns else np.zeros(len(df))
+        atrs       = df["atr_14"].values if "atr_14" in df.columns else np.zeros(len(df))
 
         X_price, X_sent, y_cls, y_reg = [], [], [], []
 
-        for i in range(sequence_len, len(df) - 1):
-            window = prices[i - sequence_len : i]
-            future_close = closes[i + 1]
+        lookahead   = settings.LOOKAHEAD_WINDOW
+        buy_thresh  = settings.BUY_THRESHOLD
+        sell_thresh = settings.SELL_THRESHOLD
+
+        # Leave enough future bars for the lookahead window
+        for i in range(sequence_len, len(df) - lookahead):
+            window        = prices[i - sequence_len : i]
             current_close = closes[i]
-            _ = pd.Timestamp(timestamps[i]).to_pydatetime()
-            atr = atrs[i] if atrs[i] > 0 else current_close * 0.02
+            atr           = atrs[i] if atrs[i] > 0 else current_close * 0.02
 
-            ret = (future_close - current_close) / current_close
-            if ret > 0.005:
-                label = 1
-            elif ret < -0.005:
-                label = 2
+            # Per-bar sentiment vector
+            bar_compound = float(social_series.iloc[i])
+            if has_social:
+                bar_pos = max(0.0,  bar_compound)
+                bar_neg = max(0.0, -bar_compound)
+                bar_neu = round(1.0 - abs(bar_compound), 6)
             else:
-                label = 0
+                bar_pos = global_pos
+                bar_neg = global_neg
+                bar_neu = global_neu
+                bar_compound = global_cmp
 
+            sent_vec = np.array(
+                [bar_pos, bar_neg, bar_neu, bar_compound], dtype=np.float32
+            )
+
+            # ── Fix 1: Triple-barrier labeling ───────────────────────────────
+            # Walk forward bar-by-bar; assign label at first barrier touched.
+            # BUY  barrier: close rises   ≥ buy_thresh  (default +2%)
+            # SELL barrier: close falls   ≥ sell_thresh (default -1%)
+            # HOLD: neither barrier touched within lookahead window.
+            # Asymmetric thresholds encode a 2:1 reward-to-risk expectation.
+            future_closes = closes[i + 1 : i + 1 + lookahead]
+            label = 0  # HOLD default
+            for fc in future_closes:
+                ret = (fc - current_close) / current_close
+                if ret >= buy_thresh:
+                    label = 1   # BUY — upper barrier hit first
+                    break
+                if ret <= -sell_thresh:
+                    label = 2   # SELL — lower barrier hit first
+                    break
+
+            # ── Fix 3: Real regression targets from actual future prices ─────
+            # entry_price  = current close (trade entered at market)
+            # take_profit  = actual future max (BUY) or min (SELL) in window
+            # stop_loss    = actual future min (BUY) or max (SELL) in window
+            # net_profit   = TP gain − SL loss ($ risk/reward in the window)
             entry = current_close
-            stop_loss = entry - 1.5 * atr if label == 1 else entry + 1.5 * atr
-            take_profit = entry + 3.0 * atr if label == 1 else entry - 3.0 * atr
-            net_profit = abs(take_profit - entry) - abs(stop_loss - entry)
+            if label == 1:  # BUY
+                take_profit = float(np.max(future_closes)) if len(future_closes) > 0 else entry * (1 + buy_thresh)
+                stop_loss   = float(np.min(future_closes)) if len(future_closes) > 0 else entry * (1 - sell_thresh)
+                net_profit  = (take_profit - entry) - (entry - stop_loss)
+            elif label == 2:  # SELL
+                take_profit = float(np.min(future_closes)) if len(future_closes) > 0 else entry * (1 - sell_thresh)
+                stop_loss   = float(np.max(future_closes)) if len(future_closes) > 0 else entry * (1 + buy_thresh)
+                net_profit  = (entry - take_profit) - (stop_loss - entry)
+            else:  # HOLD — neutral reference using ATR
+                take_profit = entry + atr
+                stop_loss   = entry - atr
+                net_profit  = 0.0
 
             bars_to_entry = compute_optimal_entry_bar(i, closes, label)
 

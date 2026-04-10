@@ -17,13 +17,19 @@ class Settings(BaseSettings):
     )
     NEWS_FETCH_LIMIT: int = 10
 
+    # Alpha Vantage — free tier: 25 calls/day, historical news with built-in sentiment
+    ALPHAVANTAGE_KEY: str = ""
+
     APP_NAME: str = "Trading Signal API"
     APP_VERSION: str = "2.0.0"
     APP_DEBUG: bool = False
 
     TICKER_LIST_PATH: str = "data/sp500.json"
     MAX_BARS_TO_ENTRY: int = 30
-    LOOKAHEAD_WINDOW: int = 5
+    # Triple-barrier labeling
+    LOOKAHEAD_WINDOW: int = 10   # max bars to look ahead for a barrier touch
+    BUY_THRESHOLD: float = 0.02  # +2% triggers BUY label
+    SELL_THRESHOLD: float = 0.01 # -1% triggers SELL label (asymmetric: 2:1 RR)
 
     @model_validator(mode="after")
     def validate_required(self) -> "Settings":
