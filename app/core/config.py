@@ -20,6 +20,9 @@ class Settings(BaseSettings):
     # Alpha Vantage — free tier: 25 calls/day, historical news with built-in sentiment
     ALPHAVANTAGE_KEY: str = ""
 
+    # Finnhub — free tier: 60 req/min, company news with historical date ranges
+    FINNHUB_API_KEY: str = ""
+
     APP_NAME: str = "Trading Signal API"
     APP_VERSION: str = "2.0.0"
     APP_DEBUG: bool = False
@@ -27,9 +30,9 @@ class Settings(BaseSettings):
     TICKER_LIST_PATH: str = "data/sp500.json"
     MAX_BARS_TO_ENTRY: int = 30
     # Triple-barrier labeling
-    LOOKAHEAD_WINDOW: int = 10   # max bars to look ahead for a barrier touch
-    BUY_THRESHOLD: float = 0.02  # +2% triggers BUY label
-    SELL_THRESHOLD: float = 0.01 # -1% triggers SELL label (asymmetric: 2:1 RR)
+    LOOKAHEAD_WINDOW: int = 5    # max bars to look ahead — shorter = less HOLD starvation
+    BUY_THRESHOLD: float = 0.015 # +1.5% triggers BUY label
+    SELL_THRESHOLD: float = 0.015 # -1.5% triggers SELL label (symmetric for balanced classes)
 
     @model_validator(mode="after")
     def validate_required(self) -> "Settings":

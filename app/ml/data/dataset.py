@@ -1,6 +1,5 @@
 import numpy as np
 import pandas as pd
-from datetime import datetime, timedelta
 from typing import List, Tuple
 import asyncpg
 import logging
@@ -76,24 +75,6 @@ REGRESSION_TARGETS = [
     "bars_to_entry",
 ]
 
-
-def compute_entry_time(current_ts: datetime, interval: str) -> datetime:
-    if interval == "1d":
-        next_day = current_ts + timedelta(days=1)
-        while next_day.weekday() >= 5:
-            next_day += timedelta(days=1)
-        return next_day.replace(hour=14, minute=30, second=0, microsecond=0)
-    elif interval == "1h":
-        next_hour = current_ts.replace(minute=0, second=0, microsecond=0) + timedelta(
-            hours=1
-        )
-        return next_hour
-    else:
-        return current_ts + timedelta(hours=1)
-
-
-def bars_until_entry(interval: str) -> float:
-    return 1.0
 
 
 def compute_optimal_entry_bar(
@@ -211,6 +192,18 @@ class DatasetBuilder:
                 interval,
             )
 
+            # Per-day sentiment from daily_sentiment table (Finnhub + FinBERT)
+            daily_sent_rows = await conn.fetch(
+                """
+                SELECT date, avg_positive, avg_negative, avg_neutral, avg_compound
+                FROM daily_sentiment
+                WHERE ticker = $1
+                ORDER BY date ASC
+                """,
+                ticker,
+            )
+
+            # Global snapshot as fallback
             sent_row = await conn.fetchrow(
                 """
                 SELECT avg_positive, avg_negative, avg_neutral, avg_compound
@@ -241,25 +234,40 @@ class DatasetBuilder:
         df = df.sort_values("timestamp").reset_index(drop=True)
         df[FEATURE_COLS] = df[FEATURE_COLS].ffill().bfill()
 
-        # ── Build per-bar sentiment vector ────────────────────────────────────
-        # Priority order:
-        #  1. social_sentiment column (AV compound score per bar) — most accurate
-        #  2. Interpolated from the global snapshot — coarse fallback
-        #  3. Neutral zeros — last resort
+        # ── Build per-bar sentiment lookup ────────────────────────────────────
+        # Priority:
+        #  1. daily_sentiment table (Finnhub + FinBERT, per trading day) — best
+        #  2. social_sentiment column (AV compound scalar per bar) — partial
+        #  3. Global snapshot — coarse fallback
+        #  4. Neutral zeros — last resort
 
+        # Build date → sentiment dict from daily_sentiment table
+        daily_sent_map: dict = {}
+        for r in daily_sent_rows:
+            date_key = str(r["date"])  # "YYYY-MM-DD"
+            daily_sent_map[date_key] = {
+                "avg_positive": float(r["avg_positive"] or 0.0),
+                "avg_negative": float(r["avg_negative"] or 0.0),
+                "avg_neutral":  float(r["avg_neutral"]  or 1.0),
+                "avg_compound": float(r["avg_compound"] or 0.0),
+            }
+
+        has_daily = len(daily_sent_map) > 0
+
+        # social_sentiment column as scalar compound fallback
         social_col = "social_sentiment"
         has_social = (
-            social_col in df.columns
+            not has_daily
+            and social_col in df.columns
             and df[social_col].notna().any()
             and (df[social_col] != 0.0).any()
         )
-
         if has_social:
-            # Forward-fill then back-fill so every bar has a value
             social_series = df[social_col].ffill().bfill().fillna(0.0)
         else:
             social_series = pd.Series(0.0, index=df.index)
 
+        # Global snapshot fallback
         if sent_row:
             global_pos = float(sent_row.get("avg_positive", 0.0))
             global_neg = float(sent_row.get("avg_negative", 0.0))
@@ -267,6 +275,29 @@ class DatasetBuilder:
             global_cmp = float(sent_row.get("avg_compound", 0.0))
         else:
             global_pos, global_neg, global_neu, global_cmp = 0.0, 0.0, 1.0, 0.0
+
+        # Pre-build a list of date strings aligned to df rows for fast lookup
+        df_dates = [
+            pd.Timestamp(ts).strftime("%Y-%m-%d") if ts is not None else ""
+            for ts in df["timestamp"].values
+        ]
+
+        # For daily_sentiment, forward-fill missing days (weekend/holiday gaps)
+        # by expanding the map to cover all dates in df
+        if has_daily:
+            sorted_daily_keys = sorted(daily_sent_map.keys())
+            last_known = {"avg_positive": 0.0, "avg_negative": 0.0,
+                          "avg_neutral": 1.0, "avg_compound": 0.0}
+            daily_sent_filled: dict = {}
+            daily_ptr = 0
+            for date_str in df_dates:
+                # Advance pointer to pick up any daily entries on or before this date
+                while daily_ptr < len(sorted_daily_keys) and sorted_daily_keys[daily_ptr] <= date_str:
+                    last_known = daily_sent_map[sorted_daily_keys[daily_ptr]]
+                    daily_ptr += 1
+                daily_sent_filled[date_str] = last_known
+        else:
+            daily_sent_filled = {}
 
         prices     = df[FEATURE_COLS].values
         closes     = df["close"].values
@@ -285,17 +316,23 @@ class DatasetBuilder:
             current_close = closes[i]
             atr           = atrs[i] if atrs[i] > 0 else current_close * 0.02
 
-            # Per-bar sentiment vector
-            bar_compound = float(social_series.iloc[i])
-            if has_social:
+            # Per-bar sentiment vector — priority: daily_sentiment > social_col > global
+            if has_daily:
+                day_sent = daily_sent_filled.get(df_dates[i], {
+                    "avg_positive": global_pos, "avg_negative": global_neg,
+                    "avg_neutral": global_neu, "avg_compound": global_cmp,
+                })
+                bar_pos     = day_sent["avg_positive"]
+                bar_neg     = day_sent["avg_negative"]
+                bar_neu     = day_sent["avg_neutral"]
+                bar_compound = day_sent["avg_compound"]
+            elif has_social:
+                bar_compound = float(social_series.iloc[i])
                 bar_pos = max(0.0,  bar_compound)
                 bar_neg = max(0.0, -bar_compound)
                 bar_neu = round(1.0 - abs(bar_compound), 6)
             else:
-                bar_pos = global_pos
-                bar_neg = global_neg
-                bar_neu = global_neu
-                bar_compound = global_cmp
+                bar_pos, bar_neg, bar_neu, bar_compound = global_pos, global_neg, global_neu, global_cmp
 
             sent_vec = np.array(
                 [bar_pos, bar_neg, bar_neu, bar_compound], dtype=np.float32
@@ -318,31 +355,44 @@ class DatasetBuilder:
                     label = 2   # SELL — lower barrier hit first
                     break
 
-            # ── Fix 3: Real regression targets from actual future prices ─────
-            # entry_price  = current close (trade entered at market)
-            # take_profit  = actual future max (BUY) or min (SELL) in window
-            # stop_loss    = actual future min (BUY) or max (SELL) in window
-            # net_profit   = TP gain − SL loss ($ risk/reward in the window)
+            # ── Regression targets as % deviations from entry ────────────────
+            # Storing absolute prices (e.g. NVDA ~$900) causes regression
+            # gradients that are ~1000× larger than classification gradients,
+            # collapsing the model to predict only one class.
+            # Solution: all price targets are stored as decimal % of entry.
+            #   entry_price  = 0.0  (always — "no deviation from current close")
+            #   stop_loss    = negative % (e.g. -0.015 = 1.5% below entry)
+            #   take_profit  = positive % (e.g. +0.030 = 3.0% above entry)
+            #   net_profit   = TP% + SL% combined
+            # At inference time, multiply by current price to recover dollars.
             entry = current_close
+            if entry <= 0:
+                continue
+
             if label == 1:  # BUY
-                take_profit = float(np.max(future_closes)) if len(future_closes) > 0 else entry * (1 + buy_thresh)
-                stop_loss   = float(np.min(future_closes)) if len(future_closes) > 0 else entry * (1 - sell_thresh)
-                net_profit  = (take_profit - entry) - (entry - stop_loss)
+                tp_abs      = float(np.max(future_closes)) if len(future_closes) > 0 else entry * (1 + buy_thresh)
+                sl_abs      = float(np.min(future_closes)) if len(future_closes) > 0 else entry * (1 - sell_thresh)
+                tp_pct      = (tp_abs - entry) / entry          # e.g. +0.03
+                sl_pct      = (sl_abs - entry) / entry          # e.g. -0.015
+                net_pct     = tp_pct + sl_pct                   # net reward-risk %
             elif label == 2:  # SELL
-                take_profit = float(np.min(future_closes)) if len(future_closes) > 0 else entry * (1 - sell_thresh)
-                stop_loss   = float(np.max(future_closes)) if len(future_closes) > 0 else entry * (1 + buy_thresh)
-                net_profit  = (entry - take_profit) - (stop_loss - entry)
-            else:  # HOLD — neutral reference using ATR
-                take_profit = entry + atr
-                stop_loss   = entry - atr
-                net_profit  = 0.0
+                tp_abs      = float(np.min(future_closes)) if len(future_closes) > 0 else entry * (1 - sell_thresh)
+                sl_abs      = float(np.max(future_closes)) if len(future_closes) > 0 else entry * (1 + buy_thresh)
+                tp_pct      = (entry - tp_abs) / entry          # positive for SELL
+                sl_pct      = (entry - sl_abs) / entry          # negative for SELL
+                net_pct     = tp_pct + sl_pct
+            else:  # HOLD
+                tp_pct      = atr / entry if entry > 0 else 0.01
+                sl_pct      = -atr / entry if entry > 0 else -0.01
+                net_pct     = 0.0
 
             bars_to_entry = compute_optimal_entry_bar(i, closes, label)
 
             X_price.append(window)
             X_sent.append(sent_vec)
             y_cls.append(label)
-            y_reg.append([entry, stop_loss, take_profit, net_profit, bars_to_entry])
+            # [0]=entry(always 0.0), [1]=sl_pct, [2]=tp_pct, [3]=net_pct, [4]=bars
+            y_reg.append([0.0, sl_pct, tp_pct, net_pct, bars_to_entry])
 
         return (
             np.array(X_price, dtype=np.float32),

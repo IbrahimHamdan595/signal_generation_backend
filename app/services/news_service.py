@@ -1,5 +1,6 @@
 import os
 import json
+import asyncio
 import httpx
 import logging
 from datetime import datetime, timedelta, timezone
@@ -592,6 +593,305 @@ def get_company_name(ticker: str) -> str:
 def get_all_sp500_tickers() -> List[str]:
     """Return the full list of S&P 500 ticker symbols."""
     return list(get_sp500_map().keys())
+
+
+FINNHUB_BASE  = "https://finnhub.io/api/v1"
+EDGAR_SEARCH  = "https://efts.sec.gov/LATEST/search-index"
+EDGAR_FILING  = "https://www.sec.gov"
+EDGAR_HEADERS = {"User-Agent": "Signal-Trading-App research@signal.app"}  # required by SEC
+
+
+class EdgarNewsService:
+    """
+    SEC EDGAR full-text search — free, no API key, no rate cap beyond 10 req/sec.
+    Fetches 8-K (material events) and 10-Q (quarterly results) filings for a
+    ticker over any historical date range going back to the 1990s.
+
+    Each filing is treated as one "article":
+      title       = form type + company name + filed date
+      description = first 1500 chars of the filing's human-readable text
+      published_at= filing date (aligns to the trading day the news hit)
+      source      = "SEC EDGAR"
+
+    These are then scored by FinBERT in the same pipeline as Finnhub articles.
+
+    SEC fair-use policy: identify your app in the User-Agent header (done above).
+    Rate limit: max 10 requests/second — we stay well under with 0.15s sleep.
+    """
+
+    # Forms that contain price-moving information
+    FORMS = "8-K,10-Q,10-K"
+
+    async def fetch_filings(
+        self,
+        ticker: str,
+        from_date: str,   # "YYYY-MM-DD"
+        to_date: str,     # "YYYY-MM-DD"
+        forms: str = None,
+        max_results: int = 200,
+    ) -> List[Dict]:
+        """
+        Search EDGAR for filings mentioning `ticker` in the given date range.
+        Returns normalised article-shaped dicts ready for FinBERT scoring.
+        """
+        forms = forms or self.FORMS
+        params = {
+            "q":         f'"{ticker}"',
+            "dateRange": "custom",
+            "startdt":   from_date,
+            "enddt":     to_date,
+            "forms":     forms,
+            "_source":   "period_of_report,file_date,entity_name,form_type,file_num",
+            "hits.hits.total.value": max_results,
+            "hits.hits._source.period_of_report": 1,
+        }
+
+        async with httpx.AsyncClient(timeout=20, headers=EDGAR_HEADERS) as client:
+            resp = await client.get(EDGAR_SEARCH, params=params)
+
+        if resp.status_code == 429:
+            await asyncio.sleep(5)
+            raise ValueError("EDGAR rate limit — retry after pause")
+        if resp.status_code != 200:
+            raise ValueError(f"EDGAR search error {resp.status_code}: {resp.text[:200]}")
+
+        data = resp.json()
+        hits = data.get("hits", {}).get("hits", [])
+        if not hits:
+            return []
+
+        logger.info(f"📄 EDGAR {ticker} ({from_date}→{to_date}): {len(hits)} filings found")
+
+        articles = []
+        for hit in hits[:max_results]:
+            src = hit.get("_source", {})
+            try:
+                article = await self._parse_filing(src, ticker)
+                if article:
+                    articles.append(article)
+                await asyncio.sleep(0.15)   # stay under 10 req/sec SEC limit
+            except Exception as e:
+                logger.debug(f"EDGAR parse failed for {ticker} filing: {e}")
+
+        return articles
+
+    async def _parse_filing(self, src: dict, ticker: str) -> Optional[Dict]:
+        """
+        Fetch the filing index page and extract human-readable text from
+        the first .htm document. Truncate to 1500 chars for FinBERT.
+        """
+        file_date  = src.get("file_date", "")
+        entity     = src.get("entity_name", ticker)
+        form_type  = src.get("form_type", "8-K")
+        accession  = src.get("accession_no", "").replace("-", "")
+        cik        = str(src.get("file_num", "")).lstrip("0") or ""
+
+        try:
+            published_at = datetime.strptime(file_date[:10], "%Y-%m-%d")
+        except ValueError:
+            published_at = datetime.now(timezone.utc).replace(tzinfo=None)
+
+        # Build filing index URL and fetch the document list
+        filing_text = ""
+        if accession and cik:
+            index_url = (
+                f"{EDGAR_FILING}/cgi-bin/browse-edgar"
+                f"?action=getcompany&CIK={cik}"
+                f"&type={form_type}&dateb=&owner=include&count=1"
+            )
+            try:
+                async with httpx.AsyncClient(
+                    timeout=15, headers=EDGAR_HEADERS, follow_redirects=True
+                ) as client:
+                    # Fetch the filing document directly via accession number
+                    doc_url = (
+                        f"{EDGAR_FILING}/Archives/edgar/data/{cik}/"
+                        f"{accession}/{accession}-index.htm"
+                    )
+                    r = await client.get(doc_url)
+                    if r.status_code == 200:
+                        # Extract visible text — strip HTML tags simply
+                        import re
+                        text = re.sub(r"<[^>]+>", " ", r.text)
+                        text = re.sub(r"\s+", " ", text).strip()
+                        filing_text = text[:1500]
+            except Exception as e:
+                logger.debug(f"[{ticker}] EDGAR filing body fetch failed (title-only): {e}")
+
+        title = f"{form_type} — {entity} ({file_date[:10]})"
+        description = filing_text or f"{form_type} filing by {entity}"
+
+        # Use accession-number-based URL as the unique identifier per filing
+        if accession and cik:
+            unique_url = f"{EDGAR_FILING}/Archives/edgar/data/{cik}/{accession}/{accession}-index.htm"
+        else:
+            # Fallback: embed ticker + date + form so different filings stay distinct
+            unique_url = f"{EDGAR_FILING}/cgi-bin/browse-edgar?ticker={ticker}&form={form_type}&date={file_date[:10]}"
+
+        return {
+            "ticker":       ticker.upper(),
+            "title":        title,
+            "description":  description,
+            "url":          unique_url,
+            "source":       "SEC EDGAR",
+            "published_at": published_at,
+        }
+
+    async def fetch_date_range(
+        self,
+        ticker: str,
+        from_date: str,   # "YYYY-MM-DD"
+        to_date: str,     # "YYYY-MM-DD"
+    ) -> List[Dict]:
+        """
+        Fetch all 8-K and 10-Q filings for ticker between from_date and to_date.
+        Splits into yearly chunks to keep result sets manageable.
+        """
+        all_articles: List[Dict] = []
+
+        start = datetime.strptime(from_date, "%Y-%m-%d")
+        end   = datetime.strptime(to_date,   "%Y-%m-%d")
+        now   = datetime.now(timezone.utc).replace(tzinfo=None)
+        end   = min(end, now)
+
+        # Iterate year by year
+        chunk_start = start
+        while chunk_start < end:
+            chunk_end = min(chunk_start + timedelta(days=365), end)
+            from_str  = chunk_start.strftime("%Y-%m-%d")
+            to_str    = chunk_end.strftime("%Y-%m-%d")
+            try:
+                filings = await self.fetch_filings(ticker, from_str, to_str)
+                all_articles.extend(filings)
+                await asyncio.sleep(0.5)
+            except Exception as e:
+                logger.warning(f"⚠️  EDGAR chunk failed ({ticker} {from_str}→{to_str}): {e}")
+                await asyncio.sleep(2)
+            chunk_start = chunk_end
+
+        logger.info(
+            f"📄 EDGAR {ticker} ({from_date}→{to_date}): "
+            f"{len(all_articles)} total filings collected"
+        )
+        return all_articles
+
+
+class FinnhubNewsService:
+    """
+    Finnhub company news — free tier: 60 req/min, no daily cap.
+    Endpoint: GET /company-news?symbol=AAPL&from=2021-01-01&to=2021-12-31
+    Returns articles with headline + summary (no sentiment — we run FinBERT).
+    Goes back several years of history.
+    """
+
+    def __init__(self):
+        self.api_key = settings.FINNHUB_API_KEY
+
+    def is_configured(self) -> bool:
+        return bool(self.api_key)
+
+    async def fetch_articles(
+        self,
+        ticker: str,
+        from_date: str,
+        to_date: str,
+    ) -> List[Dict]:
+        """
+        Fetch articles for ticker between from_date and to_date (YYYY-MM-DD).
+        Returns normalised article dicts (no sentiment scores — caller runs FinBERT).
+        """
+        if not self.api_key:
+            raise ValueError("FINNHUB_API_KEY is not set in .env")
+
+        params = {
+            "symbol": ticker.upper(),
+            "from": from_date,
+            "to": to_date,
+            "token": self.api_key,
+        }
+
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.get(f"{FINNHUB_BASE}/company-news", params=params)
+
+        if resp.status_code == 429:
+            raise ValueError("Finnhub rate limit hit — slow down requests")
+        if resp.status_code != 200:
+            raise ValueError(f"Finnhub error {resp.status_code}: {resp.text[:200]}")
+
+        articles = resp.json()
+        if not isinstance(articles, list):
+            return []
+
+        logger.info(f"📰 Finnhub {ticker} ({from_date}→{to_date}): {len(articles)} articles")
+        return [self._parse(a, ticker) for a in articles]
+
+    def _parse(self, raw: Dict, ticker: str) -> Dict:
+        """Normalise a raw Finnhub article into our internal format."""
+        ts = raw.get("datetime", 0)
+        try:
+            published_at = datetime.fromtimestamp(int(ts), tz=timezone.utc).replace(tzinfo=None)
+        except Exception:
+            published_at = datetime.now(timezone.utc).replace(tzinfo=None)
+
+        return {
+            "ticker": ticker.upper(),
+            "title": raw.get("headline") or "",
+            "description": raw.get("summary") or "",
+            "url": raw.get("url") or "",
+            "source": raw.get("source") or "Unknown",
+            "published_at": published_at,
+        }
+
+    async def fetch_date_range(
+        self,
+        ticker: str,
+        years: int = 5,
+        months_per_chunk: int = 1,
+    ) -> tuple:
+        """
+        Fetch articles going backwards month by month from today.
+        Stops early when 3 consecutive months return 0 articles —
+        this is the free tier historical boundary (~1 year back).
+
+        Returns:
+            (articles: List[Dict], cutoff_date: str)
+            cutoff_date is the earliest date successfully covered by Finnhub
+            so the caller knows where to start the EDGAR fallback from.
+        """
+        all_articles: List[Dict] = []
+        now = datetime.now(timezone.utc)
+        cutoff_date = now.strftime("%Y-%m-%d")   # will be updated as we go back
+
+        total_months = years * 12
+        consecutive_empty = 0
+        EMPTY_STOP_THRESHOLD = 3
+
+        for month_offset in range(total_months):
+            chunk_end   = now - timedelta(days=30 * month_offset)
+            chunk_start = chunk_end - timedelta(days=30 * months_per_chunk)
+            from_str    = chunk_start.strftime("%Y-%m-%d")
+            to_str      = chunk_end.strftime("%Y-%m-%d")
+            try:
+                articles = await self.fetch_articles(ticker, from_str, to_str)
+                if articles:
+                    all_articles.extend(articles)
+                    cutoff_date = from_str      # furthest back we got real data
+                    consecutive_empty = 0
+                else:
+                    consecutive_empty += 1
+                    if consecutive_empty >= EMPTY_STOP_THRESHOLD:
+                        logger.info(
+                            f"📰 Finnhub {ticker}: free tier limit reached at ~{from_str} "
+                            f"({len(all_articles)} articles collected). "
+                            f"EDGAR will cover the remaining history."
+                        )
+                        break
+                await asyncio.sleep(1.1)   # respect 60 req/min
+            except Exception as e:
+                logger.warning(f"⚠️  Finnhub chunk failed ({ticker} {from_str}→{to_str}): {e}")
+                await asyncio.sleep(2)
+
+        return all_articles, cutoff_date
 
 
 class NewsService:

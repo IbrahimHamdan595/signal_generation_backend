@@ -39,6 +39,8 @@ async def create_rule(
             INSERT INTO price_alert_rules (user_id, ticker, condition, target_price)
             VALUES ($1, $2, $3, $4) RETURNING *
         """, current_user["id"], body.ticker.upper(), body.condition, body.target_price)
+    if row is None:
+        raise HTTPException(500, "Failed to create rule")
     return dict(row)
 
 

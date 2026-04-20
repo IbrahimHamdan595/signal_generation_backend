@@ -10,6 +10,8 @@ from app.services.sentiment_service import SentimentService
 from app.services.signal_service import SignalService
 from app.services.outcome_service import OutcomeService
 from app.services.ticker_list_service import ticker_list_service
+from app.services.broker_service import BrokerService
+from app.services.execution_service import ExecutionService
 from app.ml.models.registry import is_model_trained
 
 logger = logging.getLogger(__name__)
@@ -48,20 +50,6 @@ def _listener(event):
             _job_failure_counts[job_id] = 0
 
 
-DEFAULT_TICKERS = [
-    "AAPL",
-    "MSFT",
-    "GOOGL",
-    "AMZN",
-    "NVDA",
-    "META",
-    "TSLA",
-    "JPM",
-    "V",
-    "NFLX",
-]
-
-
 async def _get_tracked_tickers() -> list:
     try:
         pool = await get_db()
@@ -70,8 +58,8 @@ async def _get_tracked_tickers() -> list:
             tickers = await svc.get_available_tickers()
             if tickers:
                 return tickers
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"Could not load tickers from DB, falling back to static list: {e}")
     return await ticker_list_service.get_tickers()
 
 
@@ -142,7 +130,7 @@ async def refresh_sentiment():
         pool = await get_db()
         tickers = await _get_tracked_tickers()
         svc = SentimentService(pool)
-        success, failed, total = await svc.run_pipeline(tickers[:20], limit=5)
+        success, failed, total = await svc.ingest_articles(tickers[:20], recent_limit=5)
         logger.info(f"✅ Sentiment refresh: {total} articles | failed: {failed}")
     except Exception as e:
         logger.error(f"❌ Sentiment refresh error: {e}")
@@ -189,6 +177,43 @@ async def regenerate_signals():
     except Exception as e:
         logger.error(f"❌ Signal regen error: {e}")
         raise
+
+    # Auto-execute for any users with auto_trade = TRUE
+    await _auto_execute_trading(pool)
+
+
+async def _auto_execute_trading(pool):
+    """
+    After signal regen, execute new signals for users who have
+    auto_trade enabled and MT5 connected.
+    Errors are logged but never propagate — trading must not crash the scheduler.
+    """
+    try:
+        broker = BrokerService()
+        if not await broker.is_connected():
+            return  # MT5 not connected — nothing to do
+
+        exec_svc = ExecutionService(pool, broker)
+
+        # Find all users with auto_trade enabled
+        async with pool.acquire() as conn:
+            users = await conn.fetch(
+                "SELECT user_id FROM trading_config WHERE auto_trade = TRUE AND enabled = TRUE"
+            )
+
+        for row in users:
+            try:
+                results = await exec_svc.auto_execute(row["user_id"])
+                if results:
+                    filled = sum(1 for r in results if r.get("ok"))
+                    logger.info(
+                        f"🤖 Auto-execute user {row['user_id']}: "
+                        f"{filled}/{len(results)} orders filled"
+                    )
+            except Exception as e:
+                logger.error(f"Auto-execute failed for user {row['user_id']}: {e}")
+    except Exception as e:
+        logger.debug(f"Auto-execute skipped: {e}")
 
 
 def start_scheduler():
@@ -260,10 +285,10 @@ def start_scheduler():
         replace_existing=True,
     )
 
-    # Check user-defined price alert rules every 5 minutes
+    # Check user-defined price alert rules every 1 minute
     scheduler.add_job(
         check_price_alert_rules,
-        CronTrigger(minute="*/5"),
+        CronTrigger(minute="*/1"),
         id="price_alert_rules",
         replace_existing=True,
     )

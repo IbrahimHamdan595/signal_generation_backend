@@ -69,8 +69,8 @@ async def train_model(
     pool=Depends(get_db),
     current_user=Depends(get_current_active_user),
 ):
-    if len(body.tickers) < 2:
-        raise HTTPException(400, "Provide at least 2 tickers for training")
+    if len(body.tickers) < 1:
+        raise HTTPException(400, "Provide at least 1 ticker for training")
     if len(body.tickers) > 100:
         raise HTTPException(400, "Max 100 tickers per training run")
 
@@ -238,6 +238,48 @@ async def get_walkforward_result(current_user=Depends(get_current_active_user)):
         raise HTTPException(404, "No walk-forward result yet. Run POST /ml/walkforward first.")
     with open(path) as f:
         return json.load(f)
+
+
+# ── Drift monitoring ──────────────────────────────────────────────────────────
+
+@router.get("/drift")
+async def check_drift(current_user=Depends(get_current_active_user)):
+    """
+    Compare the recent signal prediction distribution against the training baseline.
+    Uses the last 50 signals stored in the database.
+    Returns PSI and KL divergence — status: stable / monitor / retrain.
+    """
+    from app.ml.evaluation.drift_monitor import check_drift as _check, load_baseline
+    import json
+
+    baseline = load_baseline()
+    if baseline is None:
+        raise HTTPException(404, "No drift baseline found. Train the model first.")
+
+    # Load recent signal probabilities from the walkforward result or eval report
+    # as a proxy — real deployment would pull from the signals table
+    signal_probs_path = "checkpoints/recent_signal_probs.json"
+    if not os.path.exists(signal_probs_path):
+        raise HTTPException(
+            404,
+            "No recent signal probabilities recorded yet. "
+            "Generate signals first (POST /signals/generate/batch), "
+            "then re-check drift."
+        )
+    with open(signal_probs_path) as f:
+        recent_probs = json.load(f)
+
+    return _check(recent_probs)
+
+
+@router.get("/drift/baseline")
+async def get_drift_baseline(current_user=Depends(get_current_active_user)):
+    """Return the saved training distribution baseline used for drift detection."""
+    from app.ml.evaluation.drift_monitor import load_baseline
+    baseline = load_baseline()
+    if baseline is None:
+        raise HTTPException(404, "No drift baseline found. Train the model first.")
+    return baseline
 
 
 # ── Model versioning ──────────────────────────────────────────────────────────

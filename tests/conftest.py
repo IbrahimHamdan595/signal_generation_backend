@@ -76,7 +76,7 @@ class MockAcquire:
         return await self.conn.__aexit__(exc_type, exc_val, exc_tb)
 
 
-async def mock_acquire():
+def mock_acquire():
     return MockAcquire()
 
 

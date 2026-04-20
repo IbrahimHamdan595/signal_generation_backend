@@ -35,13 +35,23 @@ class TestSignalService:
     async def test_generate_signal_returns_valid_structure(
         self, signal_service, mock_pool
     ):
-        with patch("app.services.signal_service.get_model") as mock_get_model:
-            mock_model = MagicMock()
-            mock_model.return_value = (
-                MagicMock(argmax=MagicMock(return_value=1)),
-                MagicMock(),
-            )
-            mock_get_model.return_value = mock_model
+        predict_result = {
+            "action": "BUY",
+            "confidence": 0.85,
+            "entry_price": 150.0,
+            "stop_loss": 145.0,
+            "take_profit": 160.0,
+            "net_profit": 10.0,
+            "bars_to_entry": 1,
+            "entry_time": None,
+            "entry_time_label": None,
+            "prob_buy": 0.85,
+            "prob_sell": 0.10,
+            "prob_hold": 0.05,
+        }
+        with patch("app.services.signal_service.get_model") as mock_get_model, \
+             patch.object(signal_service.ml_svc, "predict_ticker", new=AsyncMock(return_value=predict_result)):
+            mock_get_model.return_value = MagicMock()
 
             result = await signal_service.generate_signal("AAPL", "1d")
 

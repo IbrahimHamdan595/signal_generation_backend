@@ -5,7 +5,6 @@ In-memory TTL cache with optional Redis backend.
 Falls back to in-memory if REDIS_URL is not configured.
 """
 
-import asyncio
 import json
 import logging
 import time
@@ -53,28 +52,29 @@ class _RedisCache:
             if raw is None:
                 return None
             return json.loads(raw)
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Redis get error for key '{key}': {e}")
             return None
 
     async def set(self, key: str, value: Any, ttl: int = 300):
         try:
             await self._r.setex(key, ttl, json.dumps(value, default=str))
         except Exception as e:
-            logger.warning(f"Redis set error: {e}")
+            logger.warning(f"Redis set error for key '{key}': {e}")
 
     async def delete(self, key: str):
         try:
             await self._r.delete(key)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Redis delete error for key '{key}': {e}")
 
     async def clear_pattern(self, prefix: str):
         try:
             keys = await self._r.keys(f"{prefix}*")
             if keys:
                 await self._r.delete(*keys)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Redis clear_pattern error for prefix '{prefix}': {e}")
 
 
 # ── Singleton factory ─────────────────────────────────────────────────────────

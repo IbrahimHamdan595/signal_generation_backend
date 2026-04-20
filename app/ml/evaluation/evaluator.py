@@ -10,6 +10,7 @@ from sklearn.metrics import (
     accuracy_score,
     f1_score,
 )
+from app.ml.data.dataset import FEATURE_COLS
 
 logger = logging.getLogger(__name__)
 
@@ -22,8 +23,10 @@ class ModelEvaluator:
 
     Computes:
     - Classification: accuracy, F1, confusion matrix, per-class precision/recall
-    - Regression: RMSE + MAE per target (entry, SL, TP, net_profit)
-    - Trading simulation: real-price % returns → Sharpe, win rate, max drawdown
+    - Regression: RMSE + MAE per target (% deviations from entry)
+    - Trading simulation: % returns → Sharpe, win rate, max drawdown
+    - Permutation feature importance: accuracy drop when each feature is shuffled
+    - Drift baseline: saves test-set probability distribution for drift monitoring
     """
 
     def __init__(self, model, device=None):
@@ -84,7 +87,8 @@ class ModelEvaluator:
         results["class_recall"] = class_recall
 
         # ── Regression metrics (per target) ───────────────────────────────────
-        target_names = ["entry_price", "stop_loss", "take_profit", "net_profit"]
+        # Columns: [0]=entry(0.0 anchor), [1]=sl_pct, [2]=tp_pct, [3]=net_pct
+        target_names = ["entry_pct", "sl_pct", "tp_pct", "net_pct"]
         reg_metrics  = {}
         for i, name in enumerate(target_names):
             pred_i = all_reg_pred[:, i]
@@ -99,6 +103,14 @@ class ModelEvaluator:
             all_preds, all_true, all_reg_true
         )
 
+        # ── Permutation feature importance ────────────────────────────────────
+        results["feature_importance"] = self._permutation_importance(
+            test_loader, base_accuracy=results["accuracy"]
+        )
+
+        # ── Drift baseline — save test-set probability distribution ───────────
+        self._save_drift_baseline(test_loader, results)
+
         logger.info(
             f"📊 Test Accuracy: {results['accuracy']:.4f} | "
             f"F1 (weighted): {results['f1_weighted']:.4f} | "
@@ -110,57 +122,137 @@ class ModelEvaluator:
             f"Buy: {class_recall['buy']:.4f}  "
             f"Sell: {class_recall['sell']:.4f}"
         )
+        top5 = results["feature_importance"][:5]
+        logger.info(
+            f"   Top-5 features: {[f['feature'] for f in top5]}"
+        )
         return results
+
+    def _permutation_importance(
+        self, test_loader: DataLoader, base_accuracy: float, n_repeats: int = 3
+    ) -> list:
+        """
+        Permutation feature importance: for each price feature, shuffle that
+        column across the entire test set and measure the drop in accuracy.
+
+        importance[i] = base_accuracy - accuracy_with_feature_i_shuffled
+        Higher = more important (shuffling hurts more).
+
+        Returns list of dicts sorted by importance descending.
+        """
+        n_features = len(FEATURE_COLS)
+
+        # Collect all test batches into memory (needed for shuffling per-feature)
+        all_xp, all_xs, all_yc = [], [], []
+        for xp, xs, yc, _ in test_loader:
+            all_xp.append(xp.numpy())
+            all_xs.append(xs.numpy())
+            all_yc.append(yc.numpy())
+
+        if not all_xp:
+            return []
+
+        X_price = np.concatenate(all_xp, axis=0)   # (N, seq_len, F)
+        X_sent  = np.concatenate(all_xs, axis=0)   # (N, 4)
+        y_true  = np.concatenate(all_yc, axis=0)   # (N,)
+
+        importances = []
+
+        self.model.eval()
+        with torch.no_grad():
+            for feat_idx in range(n_features):
+                drops = []
+                for _ in range(n_repeats):
+                    X_permuted = X_price.copy()
+                    # Shuffle this feature across all samples (all timesteps)
+                    perm_idx = np.random.permutation(len(X_permuted))
+                    X_permuted[:, :, feat_idx] = X_permuted[perm_idx, :, feat_idx]
+
+                    # Run inference in batches
+                    preds = []
+                    batch_size = 256
+                    for start in range(0, len(X_permuted), batch_size):
+                        xp_t = torch.tensor(X_permuted[start:start+batch_size], dtype=torch.float32).to(self.device)
+                        xs_t = torch.tensor(X_sent[start:start+batch_size],     dtype=torch.float32).to(self.device)
+                        logits, _ = self.model(xp_t, xs_t)
+                        preds.extend(logits.argmax(dim=-1).cpu().numpy().tolist())
+
+                    perm_acc = accuracy_score(y_true, preds)
+                    drops.append(base_accuracy - perm_acc)
+
+                importances.append({
+                    "feature":    FEATURE_COLS[feat_idx],
+                    "importance": round(float(np.mean(drops)), 5),
+                    "std":        round(float(np.std(drops)),  5),
+                })
+
+        importances.sort(key=lambda x: x["importance"], reverse=True)
+        return importances
+
+    def _save_drift_baseline(self, test_loader: DataLoader, results: dict) -> None:
+        """Save test-set softmax probability distributions as drift reference."""
+        try:
+            from app.ml.evaluation.drift_monitor import save_baseline
+            prob_hold, prob_buy, prob_sell = [], [], []
+
+            self.model.eval()
+            with torch.no_grad():
+                for xp, xs, _, _ in test_loader:
+                    xp = xp.to(self.device)
+                    xs = xs.to(self.device)
+                    logits, _ = self.model(xp, xs)
+                    probs = torch.softmax(logits, dim=-1).cpu().numpy()
+                    prob_hold.extend(probs[:, 0].tolist())
+                    prob_buy.extend( probs[:, 1].tolist())
+                    prob_sell.extend(probs[:, 2].tolist())
+
+            save_baseline(
+                prob_hold=np.array(prob_hold),
+                prob_buy=np.array(prob_buy),
+                prob_sell=np.array(prob_sell),
+                class_dist=results.get("class_recall", {}),
+            )
+        except Exception as e:
+            logger.warning(f"⚠️  Could not save drift baseline: {e}")
 
     def _trading_metrics(
         self,
         preds:    np.ndarray,   # (N,)  predicted class
         true:     np.ndarray,   # (N,)  true class
-        reg_true: np.ndarray,   # (N,5) true regression — entry/SL/TP from dataset
+        reg_true: np.ndarray,   # (N,5) true regression — % deviations from entry
     ) -> dict:
         """
-        Simulate real-price % returns for every non-HOLD prediction.
+        Simulate % returns for every non-HOLD prediction.
 
-        For each BUY/SELL signal:
-          - entry_price  = reg_true[:, 0]   (actual entry)
-          - take_profit  = reg_true[:, 2]   (actual TP)
-          - stop_loss    = reg_true[:, 1]   (actual SL)
+        reg_true columns (% format):
+          [0] entry  = 0.0  (anchor — always zero)
+          [1] sl_pct = negative % for BUY, negative % for SELL
+          [2] tp_pct = positive % for BUY, positive % for SELL
 
         Win condition: predicted direction matches true label.
-          Win  → return = (TP - entry) / entry  (BUY) or (entry - TP) / entry (SELL)
-          Loss → return = (SL - entry) / entry  (BUY) or (entry - SL) / entry (SELL)
+          Win  → return = tp_pct  (already a %)
+          Loss → return = sl_pct  (already a %, negative)
 
         Sharpe = annualised (assumes daily bars, 252 trading days).
         Max drawdown = largest peak-to-trough cumulative-return decline.
         """
-        returns      = []
-        entry_prices = reg_true[:, 0]
-        stop_losses  = reg_true[:, 1]
-        take_profits = reg_true[:, 2]
+        returns  = []
+        sl_pcts  = reg_true[:, 1]   # negative values for losses
+        tp_pcts  = reg_true[:, 2]   # positive values for gains
 
         for i, (p, t) in enumerate(zip(preds, true)):
             if p == 0:          # HOLD — skip
                 continue
 
-            entry = entry_prices[i]
-            sl    = stop_losses[i]
-            tp    = take_profits[i]
-
-            if entry <= 0:
-                continue
+            sl_pct = float(sl_pcts[i])
+            tp_pct = float(tp_pcts[i])
 
             if p == t:          # correct direction → hit TP
-                if p == 1:      # BUY
-                    ret = (tp - entry) / entry
-                else:           # SELL
-                    ret = (entry - tp) / entry
+                ret = abs(tp_pct)
             else:               # wrong direction → hit SL
-                if p == 1:      # predicted BUY, actual was SELL/HOLD
-                    ret = (sl - entry) / entry
-                else:           # predicted SELL, actual was BUY/HOLD
-                    ret = (entry - sl) / entry
+                ret = -abs(sl_pct)
 
-            returns.append(float(ret))
+            returns.append(ret)
 
         if not returns:
             return {

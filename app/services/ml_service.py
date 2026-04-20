@@ -1,3 +1,4 @@
+import os
 import torch
 import numpy as np
 import logging
@@ -8,7 +9,7 @@ from typing import List
 
 from app.ml.data.dataset import DatasetBuilder, FEATURE_COLS, SEQUENCE_LEN
 from app.ml.data.entry_time import entry_time_from_bars
-from app.ml.data.torch_dataset import split_dataset, split_dataset_per_ticker
+from app.ml.data.torch_dataset import split_dataset_per_ticker
 from app.ml.models.fusion_model import TradingFusionModel
 from app.ml.models.registry import (
     save_model_config,
@@ -86,7 +87,7 @@ class MLService:
             "sent_input": 4,
             "sent_dim":   16,
             "mlp_hidden": 128,
-            "dropout":    0.1,
+            "dropout":    0.3,  # increased from 0.1 — reduces overfitting (best val at epoch 5)
         }
         model = TradingFusionModel(**model_config)
         total_params = sum(p.numel() for p in model.parameters())
@@ -114,6 +115,18 @@ class MLService:
 
         save_model_config(model_config)
         save_scaler_params(scaler_params)  # now a dict: ticker → {mean, std}
+
+        # ── Walk-forward summary (3 folds, same data) ─────────────────────────
+        # Runs after the final model is trained to give N accuracy estimates
+        # across different market regimes rather than a single 70/15/15 split.
+        wf_summary = await self._embedded_walk_forward(
+            ticker_data=ticker_data,
+            model_config=model_config,
+            epochs=min(epochs, 30),
+            batch_size=batch_size,
+            lr=lr,
+            n_splits=3,
+        )
 
         # ── Register version (promotes to best_model.pt if best val_loss) ────
         version_entry = register_version(
@@ -148,13 +161,130 @@ class MLService:
                 },
                 "class_weights": class_weights.tolist(),
             },
-            "training":    train_results,
-            "evaluation":  eval_results,
+            "training":         train_results,
+            "evaluation":       eval_results,
+            "walk_forward":     wf_summary,
             "model_params": total_params,
             "checkpoint":   train_results["checkpoint"],
         }
 
-    # ── Walk-forward validation ───────────────────────────────────────────────
+    # ── Embedded walk-forward (called automatically inside train()) ──────────
+
+    async def _embedded_walk_forward(
+        self,
+        ticker_data: list,
+        model_config: dict,
+        epochs: int,
+        batch_size: int,
+        lr: float,
+        n_splits: int = 3,
+    ) -> dict:
+        """
+        Runs N expanding-window folds on the already-built ticker_data.
+        Each fold trains a fresh model and evaluates on the held-out window.
+        Returns an aggregate summary dict (not saved as a new checkpoint).
+        """
+        from app.ml.data.torch_dataset import TradingDataset, split_dataset_per_ticker
+
+        # Flatten all ticker data for global walk-forward splits
+        X_price_all = np.concatenate([d[0] for d in ticker_data], axis=0)
+        X_sent_all  = np.concatenate([d[1] for d in ticker_data], axis=0)
+        y_cls_all   = np.concatenate([d[2] for d in ticker_data], axis=0)
+        y_reg_all   = np.concatenate([d[3] for d in ticker_data], axis=0)
+
+        N = len(y_cls_all)
+        fold_size = N // (n_splits + 1)
+
+        if fold_size < 30:
+            logger.warning("⚠️  Embedded WF: not enough samples for walk-forward — skipping")
+            return {"skipped": True, "reason": "insufficient data"}
+
+        fold_results = []
+
+        for fold in range(n_splits):
+            train_end = int(N * (fold + 1) / (n_splits + 1))
+            val_end   = int(N * (fold + 2) / (n_splits + 1))
+            if train_end < 20 or (val_end - train_end) < 10:
+                continue
+
+            train_ds = TradingDataset(
+                X_price_all[:train_end], X_sent_all[:train_end],
+                y_cls_all[:train_end],   y_reg_all[:train_end],
+            )
+            val_ds = TradingDataset(
+                X_price_all[train_end:val_end], X_sent_all[train_end:val_end],
+                y_cls_all[train_end:val_end],   y_reg_all[train_end:val_end],
+            )
+
+            fold_loader_tr = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+            fold_loader_va = DataLoader(val_ds,   batch_size=batch_size, shuffle=False)
+
+            fold_cw = compute_class_weights(y_cls_all[:train_end], n_classes=3)
+            fold_model = TradingFusionModel(**model_config)
+            fold_trainer = Trainer(
+                fold_model, lr=lr, class_weights=fold_cw,
+                checkpoint_name=f"_wf_fold{fold+1}_tmp.pt",
+            )
+            fold_trainer.fit(fold_loader_tr, fold_loader_va, epochs=epochs)
+            fold_trainer.load_best()
+
+            fold_eval = ModelEvaluator(fold_model)
+            metrics   = fold_eval.evaluate(fold_loader_va)
+
+            fold_results.append({
+                "fold":         fold + 1,
+                "train_size":   train_end,
+                "val_size":     val_end - train_end,
+                "accuracy":     metrics["accuracy"],
+                "f1_weighted":  metrics["f1_weighted"],
+                "sharpe":       metrics["trading"]["sharpe_ratio"],
+                "win_rate":     metrics["trading"]["win_rate"],
+                "max_drawdown": metrics["trading"]["max_drawdown"],
+                "class_recall": metrics["class_recall"],
+            })
+            logger.info(
+                f"  WF fold {fold+1}/{n_splits}: "
+                f"acc={metrics['accuracy']:.4f}  "
+                f"sharpe={metrics['trading']['sharpe_ratio']:.4f}"
+            )
+
+            # Clean up temp checkpoint
+            tmp = f"checkpoints/_wf_fold{fold+1}_tmp.pt"
+            if os.path.exists(tmp):
+                os.remove(tmp)
+
+        if not fold_results:
+            return {"skipped": True, "reason": "all folds had insufficient data"}
+
+        def _avg(key):
+            vals = [f[key] for f in fold_results if key in f]
+            return round(float(np.mean(vals)), 4) if vals else 0.0
+
+        summary = {
+            "n_folds":      len(fold_results),
+            "avg_accuracy": _avg("accuracy"),
+            "std_accuracy": round(float(np.std([f["accuracy"] for f in fold_results])), 4),
+            "avg_f1":       _avg("f1_weighted"),
+            "avg_sharpe":   _avg("sharpe"),
+            "std_sharpe":   round(float(np.std([f["sharpe"] for f in fold_results])), 4),
+            "avg_win_rate": _avg("win_rate"),
+            "avg_max_dd":   _avg("max_drawdown"),
+            "folds":        fold_results,
+        }
+
+        # Save for the /ml/walkforward/result endpoint too
+        import json as _json
+        os.makedirs("checkpoints", exist_ok=True)
+        with open("checkpoints/walkforward_result.json", "w") as f:
+            _json.dump({"status": "success", "summary": summary, "folds": fold_results}, f, indent=2, default=str)
+
+        logger.info(
+            f"✅ Walk-forward: avg_acc={summary['avg_accuracy']:.4f} ± {summary['std_accuracy']:.4f}  "
+            f"avg_sharpe={summary['avg_sharpe']:.4f} ± {summary['std_sharpe']:.4f}"
+        )
+        return summary
+
+    # ── Walk-forward validation (standalone API endpoint) ─────────────────────
 
     async def walk_forward_validate(
         self,
@@ -205,7 +335,7 @@ class MLService:
             "sent_input": 4,
             "sent_dim":   16,
             "mlp_hidden": 128,
-            "dropout":    0.1,
+            "dropout":    0.3,
         }
 
         for fold in range(n_splits):
@@ -388,21 +518,45 @@ class MLService:
         bars_to_entry = result["bars_to_entry"][0]
         entry_time    = entry_time_from_bars(current_ts, bars_to_entry, interval)
 
+        # Regression outputs are % deviations from entry price — convert to dollars.
+        # current_close is the last close in the sequence.
+        current_close = float(X_price[-1, -1, 3])  # last bar, close column (index 3)
+
+        action       = result["action"][0]
+        sl_pct       = result["stop_loss"][0]     # e.g. -0.015
+        tp_pct       = result["take_profit"][0]   # e.g. +0.030
+        net_pct      = result["net_profit"][0]
+
+        if action == "BUY":
+            entry_dollar = current_close
+            sl_dollar    = current_close * (1 + sl_pct)
+            tp_dollar    = current_close * (1 + tp_pct)
+        elif action == "SELL":
+            entry_dollar = current_close
+            sl_dollar    = current_close * (1 - sl_pct)
+            tp_dollar    = current_close * (1 - tp_pct)
+        else:  # HOLD
+            entry_dollar = current_close
+            sl_dollar    = current_close * (1 + sl_pct)
+            tp_dollar    = current_close * (1 + tp_pct)
+
+        net_dollar = abs(tp_dollar - entry_dollar) - abs(sl_dollar - entry_dollar)
+
         output = {
             "ticker":     ticker.upper(),
             "interval":   interval,
-            "action":     result["action"][0],
+            "action":     action,
             "confidence": round(result["confidence"][0], 4),
             "probabilities": {
                 "hold": round(result["probabilities"]["hold"][0], 4),
                 "buy":  round(result["probabilities"]["buy"][0],  4),
                 "sell": round(result["probabilities"]["sell"][0], 4),
             },
-            "entry_price":  round(result["entry_price"][0],   4),
-            "stop_loss":    round(result["stop_loss"][0],      4),
-            "take_profit":  round(result["take_profit"][0],    4),
-            "net_profit":   round(result["net_profit"][0],     4),
-            "bars_to_entry":round(result["bars_to_entry"][0],  2),
+            "entry_price":  round(entry_dollar, 4),
+            "stop_loss":    round(sl_dollar,    4),
+            "take_profit":  round(tp_dollar,    4),
+            "net_profit":   round(net_dollar,   4),
+            "bars_to_entry":round(bars_to_entry, 2),
             "entry_time":   entry_time.isoformat(),
             "entry_time_label": _entry_label(entry_time, interval),
             "source":       "ml_model",

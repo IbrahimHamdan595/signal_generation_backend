@@ -1,8 +1,28 @@
 import asyncio
 import asyncpg
+import json
+import os
 from datetime import datetime, timezone
 from typing import List, Optional
 import logging
+
+_SIGNAL_PROBS_PATH = "checkpoints/recent_signal_probs.json"
+_MAX_RECENT = 200   # keep last 200 predictions for drift checks
+
+def _record_signal_probs(probs: dict) -> None:
+    """Append prediction probabilities to the drift monitoring log."""
+    try:
+        log = []
+        if os.path.exists(_SIGNAL_PROBS_PATH):
+            with open(_SIGNAL_PROBS_PATH) as f:
+                log = json.load(f)
+        log.append({"hold": probs.get("hold", 0), "buy": probs.get("buy", 0), "sell": probs.get("sell", 0)})
+        log = log[-_MAX_RECENT:]
+        os.makedirs(os.path.dirname(_SIGNAL_PROBS_PATH), exist_ok=True)
+        with open(_SIGNAL_PROBS_PATH, "w") as f:
+            json.dump(log, f)
+    except Exception:
+        pass  # drift logging is non-critical
 
 from app.services.ml_service import MLService
 from app.services.alert_service import AlertService
@@ -35,8 +55,8 @@ class SignalService:
         if result.get("entry_time"):
             try:
                 entry_time = datetime.fromisoformat(result["entry_time"])
-            except Exception:
-                pass
+            except ValueError:
+                logger.warning(f"[{ticker}] Could not parse entry_time: {result['entry_time']!r}")
 
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
@@ -71,6 +91,7 @@ class SignalService:
             logger.info(
                 f"✅ Signal stored: {ticker} → {result['action']} @ {result.get('entry_time')}"
             )
+            _record_signal_probs(result.get("probabilities", {}))
 
         # Fire alert for high-confidence directional signals
         try:
@@ -137,28 +158,6 @@ class SignalService:
         tasks = [self.generate_and_store(ticker, interval) for ticker in tickers]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         return [r for r in results if r is not None and not isinstance(r, Exception)]
-
-    async def generate_batch_with_skip_report(
-        self, tickers: List[str], interval: str = "1d"
-    ) -> dict:
-        tasks = [self.generate_and_store(ticker, interval) for ticker in tickers]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        generated = []
-        skipped = []
-
-        for ticker, result in zip(tickers, results):
-            if result is None or isinstance(result, Exception):
-                skipped.append(ticker)
-            else:
-                generated.append(result)
-
-        return {
-            "generated": len(generated),
-            "skipped": len(skipped),
-            "skipped_tickers": skipped,
-            "signals": generated,
-        }
 
     async def get_latest(self, ticker: str, interval: str = "1d") -> Optional[dict]:
         async with self.pool.acquire() as conn:

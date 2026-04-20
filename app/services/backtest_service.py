@@ -17,8 +17,6 @@ Key design choices:
 import asyncpg
 import numpy as np
 import logging
-from datetime import datetime, timezone
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -68,9 +66,7 @@ class BacktestService:
         if not signals or not ohlcv:
             return {"error": f"No signals or OHLCV data for {ticker}"}
 
-        # Index OHLCV by timestamp for fast lookup
-        ohlcv_index = {row["timestamp"]: row for row in ohlcv}
-        ohlcv_list  = list(ohlcv)
+        ohlcv_list = list(ohlcv)
 
         equity        = initial_capital
         peak_equity   = initial_capital

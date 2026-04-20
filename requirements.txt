@@ -9,7 +9,7 @@ python-dotenv>=1.0.1
 asyncpg>=0.29.0
 psycopg2-binary>=2.9.9
 psycopg[binary]>=2.9.9
-1
+alembic>=1.13.0
 # ── Auth ──────────────────────────────────────────────────
 python-jose[cryptography]>=3.3.0
 passlib[bcrypt]>=1.7.4
@@ -36,6 +36,11 @@ tqdm>=4.66.0
 
 # ── Phase 4: Scheduler ────────────────────────────────────
 apscheduler>=3.10.0
+
+# ── Phase 5: Broker Integration ───────────────────────────
+# Windows-only — requires MT5 terminal installed and running.
+# Comment out on Linux/macOS CI environments.
+MetaTrader5>=5.0.45
 
 # ── Rate Limiting ─────────────────────────────────────────
 slowapi>=0.1.9

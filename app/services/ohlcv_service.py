@@ -1,13 +1,13 @@
+import asyncio
 import yfinance as yf
 import pandas as pd
 import ta
 import numpy as np
 import asyncpg
 import httpx
-from datetime import datetime, date, timezone, timedelta
+from datetime import datetime, date, timezone
 from typing import List, Tuple, Optional
 import logging
-import time
 
 # ── Module-level caches (shared across all OHLCVService instances) ────────────
 # VIX: keyed by period string → (Series, fetched_date)
@@ -20,65 +20,96 @@ logger = logging.getLogger(__name__)
 VALID_INTERVALS = {"1d", "1h", "5m", "15m", "30m"}
 VALID_PERIODS = {"1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y"}
 
-YF_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Referer": "https://finance.yahoo.com/",
-}
-
 
 class OHLCVService:
     def __init__(self, pool: asyncpg.Pool):
         self.pool = pool
 
     async def ingest_tickers(
-        self, tickers: List[str], interval: str = "1d", period: str = "1y"
+        self,
+        tickers: List[str],
+        interval: str = "1d",
+        period: str = "1y",
+        concurrency: int = 5,
     ) -> Tuple[List[str], List[str], int]:
-        success, failed, total = [], [], 0
-        for ticker in tickers:
-            try:
-                count = await self._ingest_single(ticker.upper(), interval, period)
-                success.append(ticker.upper())
-                total += count
-                logger.info(f"✅ {ticker}: {count} records ingested")
-            except Exception as e:
-                failed.append(ticker.upper())
-                logger.error(f"❌ {ticker}: {e}")
-            time.sleep(2)
+        """
+        Ingest multiple tickers concurrently using a semaphore to stay within
+        Yahoo Finance's rate limit (~2 req/s).
+
+        concurrency=5 with a 0.5s stagger between slot acquisitions keeps the
+        effective request rate at ~2/s while finishing 5x faster than serial.
+        For 500 tickers: ~8 min instead of ~40 min.
+        """
+        success: List[str] = []
+        failed:  List[str] = []
+        total = 0
+        sem = asyncio.Semaphore(concurrency)
+        lock = asyncio.Lock()   # protects the shared result lists
+
+        async def _fetch_one(ticker: str) -> None:
+            nonlocal total
+            async with sem:
+                # Stagger starts so N concurrent slots don't all fire at t=0
+                await asyncio.sleep(0.5)
+                try:
+                    count = await self._ingest_single(ticker.upper(), interval, period)
+                    async with lock:
+                        success.append(ticker.upper())
+                        total += count
+                    logger.info(f"✅ {ticker}: {count} records ingested")
+                except Exception as e:
+                    async with lock:
+                        failed.append(ticker.upper())
+                    logger.error(f"❌ {ticker}: {e}")
+
+        await asyncio.gather(*[_fetch_one(t) for t in tickers])
         return success, failed, total
 
     async def _ingest_single(self, ticker: str, interval: str, period: str) -> int:
+        loop = asyncio.get_event_loop()
         max_retries = 3
         df = None
 
         for attempt in range(max_retries):
             try:
-                yf_ticker = yf.Ticker(ticker)
-                df = yf_ticker.history(interval=interval, period=period)
+                # yf.download() is more stable than Ticker.history() in yfinance 0.2.x+
+                # threads=False prevents nested thread spawning inside the executor
+                _t = ticker  # capture for lambda closure
+                _i = interval
+                _p = period
+                df = await loop.run_in_executor(
+                    None,
+                    lambda: yf.download(
+                        _t,
+                        period=_p,
+                        interval=_i,
+                        progress=False,
+                        auto_adjust=True,
+                        actions=False,
+                        threads=False,
+                    ),
+                )
 
                 if df is not None and not df.empty:
-                    logger.info(
-                        f"✅ Successfully fetched {ticker} (attempt {attempt + 1})"
-                    )
+                    logger.info(f"✅ Successfully fetched {ticker} (attempt {attempt + 1})")
                     break
                 else:
+                    # Empty result is usually Yahoo Finance rate-limiting or a transient
+                    # parse error inside yfinance — always retry with a longer wait
+                    wait_time = 10 * (attempt + 1)
                     logger.warning(
-                        f"⚠️ Empty response for {ticker}, attempt {attempt + 1}/{max_retries}"
+                        f"⚠️ Empty response for {ticker}, attempt {attempt + 1}/{max_retries} "
+                        f"— retrying in {wait_time}s"
                     )
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(wait_time)
 
             except Exception as e:
                 logger.warning(f"⚠️ Attempt {attempt + 1} failed for {ticker}: {str(e)}")
-                wait_time = 2**attempt
                 if attempt < max_retries - 1:
+                    wait_time = 5 * (attempt + 1)
                     logger.info(f"⏳ Retrying {ticker} in {wait_time}s...")
-                    time.sleep(wait_time)
+                    await asyncio.sleep(wait_time)
 
         if df is None or df.empty:
             raise ValueError(
@@ -109,149 +140,142 @@ class OHLCVService:
         if df.empty:
             raise ValueError(f"DataFrame empty after cleaning for {ticker}")
 
-        # ── Fetch real external data to replace stubs ─────────────────────────
-        vix_series      = self._fetch_vix_series(period)
-        earnings_dates  = self._fetch_earnings_dates(ticker)
-        putcall_series  = self._fetch_putcall_series()
+        # Strip timezone so all downstream comparisons with tz-naive VIX/earnings
+        # series don't raise TypeError (yf.download returns tz-aware index)
+        if pd.api.types.is_datetime64tz_dtype(df["timestamp"]):
+            df["timestamp"] = df["timestamp"].dt.tz_localize(None)
 
-        indicators_df = self._compute_indicators(
-            df, vix_series, earnings_dates, putcall_series
+        # ── Fetch real external data (all blocking — run in thread pool) ────────
+        vix_series, earnings_dates, putcall_series = await asyncio.gather(
+            loop.run_in_executor(None, lambda: self._fetch_vix_series(period)),
+            loop.run_in_executor(None, lambda: self._fetch_earnings_dates(ticker)),
+            loop.run_in_executor(None, lambda: self._fetch_putcall_series()),
         )
 
+        indicators_df = await loop.run_in_executor(
+            None,
+            lambda: self._compute_indicators(df, vix_series, earnings_dates, putcall_series),
+        )
+
+        def safe(val):
+            try:
+                v = float(val)
+                return None if np.isnan(v) else v
+            except Exception:
+                return None
+
+        def norm_ts(ts):
+            ts = ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts
+            if hasattr(ts, "tzinfo") and ts.tzinfo is not None:
+                ts = ts.replace(tzinfo=None)
+            return ts
+
+        ingested_at = datetime.now(timezone.utc)
+
+        # Build bulk records — one round-trip per table instead of one per row
+        ohlcv_records = [
+            (
+                ticker, interval, norm_ts(row["timestamp"]),
+                float(row.get("open", 0)), float(row.get("high", 0)),
+                float(row.get("low", 0)), float(row.get("close", 0)),
+                float(row.get("volume", 0)), ingested_at,
+            )
+            for _, row in df.iterrows()
+        ]
+
+        indicator_records = [
+            (
+                ticker, interval, norm_ts(row["timestamp"]),
+                safe(row.get("sma_20")), safe(row.get("sma_50")),
+                safe(row.get("ema_12")), safe(row.get("ema_26")),
+                safe(row.get("rsi_14")), safe(row.get("macd_line")),
+                safe(row.get("macd_signal")), safe(row.get("macd_histogram")),
+                safe(row.get("atr_14")), safe(row.get("bb_upper")),
+                safe(row.get("bb_middle")), safe(row.get("bb_lower")),
+                safe(row.get("bb_bandwidth")), safe(row.get("obv")),
+                safe(row.get("mfi_14")), safe(row.get("volume_roc")),
+                safe(row.get("stoch_k")), safe(row.get("stoch_d")),
+                row.get("day_of_week"), row.get("day_of_month"),
+                row.get("month"), row.get("is_trading_day"),
+                safe(row.get("adx")), safe(row.get("plus_di")),
+                safe(row.get("minus_di")), safe(row.get("pivot")),
+                safe(row.get("resistance_1")), safe(row.get("support_1")),
+                safe(row.get("resistance_2")), safe(row.get("support_2")),
+                safe(row.get("price_sma20_dist")), safe(row.get("price_sma50_dist")),
+                row.get("high_vol_regime"), row.get("above_sma50"),
+                row.get("above_sma200"), safe(row.get("normalized_volatility")),
+                safe(row.get("bb_position")), safe(row.get("roc_5")),
+                safe(row.get("roc_10")), row.get("higher_high"),
+                row.get("lower_low"), safe(row.get("price_change_pct")),
+                row.get("volume_above_avg"), safe(row.get("vix_level")),
+                safe(row.get("vix_change")), row.get("earnings_days"),
+                safe(row.get("social_sentiment")),
+                safe(row.get("options_put_call_ratio")), ingested_at,
+            )
+            for _, row in indicators_df.iterrows()
+        ]
+
         async with self.pool.acquire() as conn:
-            for _, row in df.iterrows():
-                ts = row["timestamp"]
-                ts = ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts
-                if hasattr(ts, "tzinfo") and ts.tzinfo is not None:
-                    ts = ts.replace(tzinfo=None)
+            # OHLCV — single executemany call (one server round-trip)
+            await conn.executemany(
+                """
+                INSERT INTO ohlcv_data (ticker, interval, timestamp, open, high, low, close, volume, ingested_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                ON CONFLICT (ticker, interval, timestamp) DO UPDATE SET
+                    open = EXCLUDED.open, high = EXCLUDED.high, low = EXCLUDED.low,
+                    close = EXCLUDED.close, volume = EXCLUDED.volume, ingested_at = EXCLUDED.ingested_at
+                """,
+                ohlcv_records,
+            )
 
-                await conn.execute(
-                    """
-                    INSERT INTO ohlcv_data (ticker, interval, timestamp, open, high, low, close, volume, ingested_at)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                    ON CONFLICT (ticker, interval, timestamp) DO UPDATE SET
-                        open = EXCLUDED.open, high = EXCLUDED.high, low = EXCLUDED.low,
-                        close = EXCLUDED.close, volume = EXCLUDED.volume, ingested_at = EXCLUDED.ingested_at
-                    """,
-                    ticker,
-                    interval,
-                    ts,
-                    float(row.get("open", 0)),
-                    float(row.get("high", 0)),
-                    float(row.get("low", 0)),
-                    float(row.get("close", 0)),
-                    float(row.get("volume", 0)),
-                    datetime.now(timezone.utc),
+            # Indicators — single executemany call
+            await conn.executemany(
+                """
+                INSERT INTO indicators (
+                    ticker, interval, timestamp, sma_20, sma_50, ema_12, ema_26, rsi_14,
+                    macd_line, macd_signal, macd_histogram, atr_14, bb_upper, bb_middle, bb_lower,
+                    bb_bandwidth, obv, mfi_14, volume_roc, stoch_k, stoch_d, day_of_week,
+                    day_of_month, month, is_trading_day, adx, plus_di, minus_di, pivot,
+                    resistance_1, support_1, resistance_2, support_2, price_sma20_dist,
+                    price_sma50_dist, high_vol_regime, above_sma50, above_sma200,
+                    normalized_volatility, bb_position, roc_5, roc_10, higher_high,
+                    lower_low, price_change_pct, volume_above_avg, vix_level, vix_change,
+                    earnings_days, social_sentiment, options_put_call_ratio, computed_at
+                ) VALUES (
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                    $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25,
+                    $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37,
+                    $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49,
+                    $50, $51, $52
                 )
-
-            for _, row in indicators_df.iterrows():
-                ts = row["timestamp"]
-                ts = ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts
-                if hasattr(ts, "tzinfo") and ts.tzinfo is not None:
-                    ts = ts.replace(tzinfo=None)
-
-                def safe(val):
-                    try:
-                        v = float(val)
-                        return None if np.isnan(v) else v
-                    except Exception:
-                        return None
-
-                await conn.execute(
-                    """
-                    INSERT INTO indicators (
-                        ticker, interval, timestamp, sma_20, sma_50, ema_12, ema_26, rsi_14,
-                        macd_line, macd_signal, macd_histogram, atr_14, bb_upper, bb_middle, bb_lower,
-                        bb_bandwidth, obv, mfi_14, volume_roc, stoch_k, stoch_d, day_of_week,
-                        day_of_month, month, is_trading_day, adx, plus_di, minus_di, pivot,
-                        resistance_1, support_1, resistance_2, support_2, price_sma20_dist,
-                        price_sma50_dist, high_vol_regime, above_sma50, above_sma200,
-                        normalized_volatility, bb_position, roc_5, roc_10, higher_high,
-                        lower_low, price_change_pct, volume_above_avg, vix_level, vix_change,
-                        earnings_days, social_sentiment, options_put_call_ratio, computed_at
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-                        $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29,
-                        $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43,
-                        $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56)
-                    ON CONFLICT (ticker, interval, timestamp) DO UPDATE SET
-                        sma_20 = EXCLUDED.sma_20, sma_50 = EXCLUDED.sma_50, ema_12 = EXCLUDED.ema_12,
-                        ema_26 = EXCLUDED.ema_26, rsi_14 = EXCLUDED.rsi_14, macd_line = EXCLUDED.macd_line,
-                        macd_signal = EXCLUDED.macd_signal, macd_histogram = EXCLUDED.macd_histogram,
-                        atr_14 = EXCLUDED.atr_14, bb_upper = EXCLUDED.bb_upper, bb_middle = EXCLUDED.bb_middle,
-                        bb_lower = EXCLUDED.bb_lower, bb_bandwidth = EXCLUDED.bb_bandwidth,
-                        obv = EXCLUDED.obv, mfi_14 = EXCLUDED.mfi_14, volume_roc = EXCLUDED.volume_roc,
-                        stoch_k = EXCLUDED.stoch_k, stoch_d = EXCLUDED.stoch_d,
-                        day_of_week = EXCLUDED.day_of_week, day_of_month = EXCLUDED.day_of_month,
-                        month = EXCLUDED.month, is_trading_day = EXCLUDED.is_trading_day,
-                        adx = EXCLUDED.adx, plus_di = EXCLUDED.plus_di, minus_di = EXCLUDED.minus_di,
-                        pivot = EXCLUDED.pivot, resistance_1 = EXCLUDED.resistance_1,
-                        support_1 = EXCLUDED.support_1, resistance_2 = EXCLUDED.resistance_2,
-                        support_2 = EXCLUDED.support_2, price_sma20_dist = EXCLUDED.price_sma20_dist,
-                        price_sma50_dist = EXCLUDED.price_sma50_dist, high_vol_regime = EXCLUDED.high_vol_regime,
-                        above_sma50 = EXCLUDED.above_sma50, above_sma200 = EXCLUDED.above_sma200,
-                        normalized_volatility = EXCLUDED.normalized_volatility,
-                        bb_position = EXCLUDED.bb_position, roc_5 = EXCLUDED.roc_5,
-                        roc_10 = EXCLUDED.roc_10, higher_high = EXCLUDED.higher_high,
-                        lower_low = EXCLUDED.lower_low, price_change_pct = EXCLUDED.price_change_pct,
-                        volume_above_avg = EXCLUDED.volume_above_avg, vix_level = EXCLUDED.vix_level,
-                        vix_change = EXCLUDED.vix_change, earnings_days = EXCLUDED.earnings_days,
-                        social_sentiment = EXCLUDED.social_sentiment,
-                        options_put_call_ratio = EXCLUDED.options_put_call_ratio,
-                        computed_at = EXCLUDED.computed_at
-                    """,
-                    ticker,
-                    interval,
-                    ts,
-                    safe(row.get("sma_20")),
-                    safe(row.get("sma_50")),
-                    safe(row.get("ema_12")),
-                    safe(row.get("ema_26")),
-                    safe(row.get("rsi_14")),
-                    safe(row.get("macd_line")),
-                    safe(row.get("macd_signal")),
-                    safe(row.get("macd_histogram")),
-                    safe(row.get("atr_14")),
-                    safe(row.get("bb_upper")),
-                    safe(row.get("bb_middle")),
-                    safe(row.get("bb_lower")),
-                    safe(row.get("bb_bandwidth")),
-                    safe(row.get("obv")),
-                    safe(row.get("mfi_14")),
-                    safe(row.get("volume_roc")),
-                    safe(row.get("stoch_k")),
-                    safe(row.get("stoch_d")),
-                    row.get("day_of_week"),
-                    row.get("day_of_month"),
-                    row.get("month"),
-                    row.get("is_trading_day"),
-                    safe(row.get("adx")),
-                    safe(row.get("plus_di")),
-                    safe(row.get("minus_di")),
-                    safe(row.get("pivot")),
-                    safe(row.get("resistance_1")),
-                    safe(row.get("support_1")),
-                    safe(row.get("resistance_2")),
-                    safe(row.get("support_2")),
-                    safe(row.get("price_sma20_dist")),
-                    safe(row.get("price_sma50_dist")),
-                    row.get("high_vol_regime"),
-                    row.get("above_sma50"),
-                    row.get("above_sma200"),
-                    safe(row.get("normalized_volatility")),
-                    safe(row.get("bb_position")),
-                    safe(row.get("roc_5")),
-                    safe(row.get("roc_10")),
-                    row.get("higher_high"),
-                    row.get("lower_low"),
-                    safe(row.get("price_change_pct")),
-                    row.get("volume_above_avg"),
-                    safe(row.get("vix_level")),
-                    safe(row.get("vix_change")),
-                    row.get("earnings_days"),
-                    safe(row.get("social_sentiment")),
-                    safe(row.get("options_put_call_ratio")),
-                    datetime.now(timezone.utc),
-                )
+                ON CONFLICT (ticker, interval, timestamp) DO UPDATE SET
+                    sma_20 = EXCLUDED.sma_20, sma_50 = EXCLUDED.sma_50, ema_12 = EXCLUDED.ema_12,
+                    ema_26 = EXCLUDED.ema_26, rsi_14 = EXCLUDED.rsi_14, macd_line = EXCLUDED.macd_line,
+                    macd_signal = EXCLUDED.macd_signal, macd_histogram = EXCLUDED.macd_histogram,
+                    atr_14 = EXCLUDED.atr_14, bb_upper = EXCLUDED.bb_upper, bb_middle = EXCLUDED.bb_middle,
+                    bb_lower = EXCLUDED.bb_lower, bb_bandwidth = EXCLUDED.bb_bandwidth,
+                    obv = EXCLUDED.obv, mfi_14 = EXCLUDED.mfi_14, volume_roc = EXCLUDED.volume_roc,
+                    stoch_k = EXCLUDED.stoch_k, stoch_d = EXCLUDED.stoch_d,
+                    day_of_week = EXCLUDED.day_of_week, day_of_month = EXCLUDED.day_of_month,
+                    month = EXCLUDED.month, is_trading_day = EXCLUDED.is_trading_day,
+                    adx = EXCLUDED.adx, plus_di = EXCLUDED.plus_di, minus_di = EXCLUDED.minus_di,
+                    pivot = EXCLUDED.pivot, resistance_1 = EXCLUDED.resistance_1,
+                    support_1 = EXCLUDED.support_1, resistance_2 = EXCLUDED.resistance_2,
+                    support_2 = EXCLUDED.support_2, price_sma20_dist = EXCLUDED.price_sma20_dist,
+                    price_sma50_dist = EXCLUDED.price_sma50_dist, high_vol_regime = EXCLUDED.high_vol_regime,
+                    above_sma50 = EXCLUDED.above_sma50, above_sma200 = EXCLUDED.above_sma200,
+                    normalized_volatility = EXCLUDED.normalized_volatility,
+                    bb_position = EXCLUDED.bb_position, roc_5 = EXCLUDED.roc_5,
+                    roc_10 = EXCLUDED.roc_10, higher_high = EXCLUDED.higher_high,
+                    lower_low = EXCLUDED.lower_low, price_change_pct = EXCLUDED.price_change_pct,
+                    volume_above_avg = EXCLUDED.volume_above_avg, vix_level = EXCLUDED.vix_level,
+                    vix_change = EXCLUDED.vix_change, earnings_days = EXCLUDED.earnings_days,
+                    social_sentiment = EXCLUDED.social_sentiment,
+                    options_put_call_ratio = EXCLUDED.options_put_call_ratio,
+                    computed_at = EXCLUDED.computed_at
+                """,
+                indicator_records,
+            )
 
         return len(df)
 
@@ -273,7 +297,10 @@ class OHLCVService:
             # yfinance sometimes returns a MultiIndex column
             if hasattr(close, "columns"):
                 close = close.iloc[:, 0]
-            close.index = pd.to_datetime(close.index).normalize()
+            idx = pd.to_datetime(close.index)
+            if idx.tz is not None:
+                idx = idx.tz_convert(None)
+            close.index = idx.normalize()
             _VIX_CACHE[period] = (close, today)
             logger.info(f"✅ VIX: loaded {len(close)} bars")
             return close
@@ -282,13 +309,17 @@ class OHLCVService:
             return pd.Series(dtype=float)
 
     def _fetch_earnings_dates(self, ticker: str) -> pd.DatetimeIndex:
-        """Return normalised DatetimeIndex of all known earnings dates for ticker."""
+        """Return normalised tz-naive DatetimeIndex of all known earnings dates for ticker."""
         try:
             t = yf.Ticker(ticker)
             ed = t.earnings_dates
             if ed is None or ed.empty:
                 return pd.DatetimeIndex([])
-            idx = pd.to_datetime(ed.index).normalize().sort_values()
+            idx = pd.to_datetime(ed.index)
+            # yfinance returns tz-aware index (America/New_York) — strip for tz-naive comparison
+            if idx.tz is not None:
+                idx = idx.tz_convert(None)
+            idx = idx.normalize().sort_values()
             logger.info(f"✅ Earnings for {ticker}: {len(idx)} dates")
             return idx
         except Exception as e:
@@ -299,18 +330,20 @@ class OHLCVService:
         """
         Download CBOE equity put/call ratio history (public CSV).
         Returns a date-indexed Series (date → ratio).
-        Cached for the day.
+        Cached for the day; a failed fetch is also cached to avoid
+        re-attempting (and re-logging) on every ticker.
         """
         global _PUTCALL_CACHE
         today = date.today()
         if _PUTCALL_CACHE and _PUTCALL_CACHE[1] == today:
-            return _PUTCALL_CACHE[0]
+            return _PUTCALL_CACHE[0]  # may be an empty Series if previously failed
+
         url = "https://cdn.cboe.com/api/global/us_indices/daily_prices/EQPC_History.csv"
+        empty = pd.Series(dtype=float)
         try:
             resp = httpx.get(url, timeout=15, follow_redirects=True)
             resp.raise_for_status()
             from io import StringIO
-            # CBOE CSV has a header row then: Date, EQPC
             df = pd.read_csv(StringIO(resp.text), skiprows=1, names=["date", "pc"])
             df["date"] = pd.to_datetime(df["date"], errors="coerce")
             df = df.dropna(subset=["date"])
@@ -320,8 +353,10 @@ class OHLCVService:
             logger.info(f"✅ CBOE put/call: loaded {len(series)} days")
             return series
         except Exception as e:
-            logger.warning(f"⚠️  CBOE put/call fetch failed: {e}")
-            return pd.Series(dtype=float)
+            # Cache the failure so we don't retry (and re-log) on every ticker
+            _PUTCALL_CACHE = (empty, today)
+            logger.warning(f"⚠️  CBOE put/call unavailable (will use stub 1.0): {e}")
+            return empty
 
     # ── Indicator computation ─────────────────────────────────────────────────
 
@@ -363,23 +398,18 @@ class OHLCVService:
         sma_volume = ta.trend.sma_indicator(volume, window=20)
         out["volume_roc"] = ((volume - sma_volume) / sma_volume * 100).fillna(0)
 
-        stoch = ta.momentum.stoch(high, low, close, window=14, smooth_k=3, smooth_d=3)
-        out["stoch_k"] = stoch
-        out["stoch_d"] = ta.momentum.stoch_signal(
-            high, low, close, window=14, smooth_k=3, smooth_d=3
-        )
+        out["stoch_k"] = ta.momentum.stoch(high, low, close, window=14, smooth_window=3)
+        out["stoch_d"] = ta.momentum.stoch_signal(high, low, close, window=14, smooth_window=3)
 
         out["day_of_week"] = df["timestamp"].dt.dayofweek
         out["day_of_month"] = df["timestamp"].dt.day
         out["month"] = df["timestamp"].dt.month
         out["is_trading_day"] = (~df["timestamp"].dt.dayofweek.isin([5, 6])).astype(int)
 
-        adx_indicator = ta.trend.adx(high, low, close, window=14)
-        out["adx"] = adx_indicator
-        plus_di = ta.trend.plus_di(high, low, close, window=14)
-        minus_di = ta.trend.minus_di(high, low, close, window=14)
-        out["plus_di"] = plus_di
-        out["minus_di"] = minus_di
+        _adx = ta.trend.ADXIndicator(high, low, close, window=14)
+        out["adx"] = _adx.adx()
+        out["plus_di"] = _adx.adx_pos()
+        out["minus_di"] = _adx.adx_neg()
 
         pivot = (high + low + close) / 3
         out["pivot"] = pivot
@@ -423,7 +453,7 @@ class OHLCVService:
         if vix_series is not None and not vix_series.empty:
             mapped = bar_dates.map(vix_series)
             # Forward-fill gaps (weekends/holidays) up to 5 days
-            mapped = mapped.fillna(method="ffill", limit=5).fillna(20.0)
+            mapped = mapped.ffill(limit=5).fillna(20.0)
             out["vix_level"] = mapped.values
             out["vix_change"] = (
                 pd.Series(out["vix_level"]).pct_change().fillna(0.0) * 100
@@ -451,7 +481,7 @@ class OHLCVService:
         if putcall_series is not None and not putcall_series.empty:
             mapped_pc = bar_dates.map(putcall_series)
             out["options_put_call_ratio"] = (
-                mapped_pc.fillna(method="ffill", limit=5).fillna(1.0).values
+                mapped_pc.ffill(limit=5).fillna(1.0).values
             )
         else:
             out["options_put_call_ratio"] = 1.0
