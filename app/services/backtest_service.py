@@ -156,7 +156,11 @@ class BacktestService:
         wins     = [t for t in trades if t["outcome"] == "WIN"]
         losses   = [t for t in trades if t["outcome"] == "LOSS"]
         rets     = np.array([t["return_pct"] / 100 for t in trades])
-        sharpe   = float(np.mean(rets) / (np.std(rets) + 1e-8) * np.sqrt(252)) if len(rets) > 1 else 0.0
+        std_rets = float(np.std(rets))
+        if len(rets) > 1 and std_rets > 1e-6:
+            sharpe = float(np.mean(rets) / std_rets * np.sqrt(252))
+        else:
+            sharpe = 0.0
         total_ret = (equity - initial_capital) / initial_capital
 
         return {

@@ -20,10 +20,18 @@ router = APIRouter(prefix="/ml", tags=["ML Model"])
 class TrainRequest(BaseModel):
     tickers: List[str] = Field(..., description="Tickers to train on")
     interval: str = Field(default="1d")
-    epochs: int = Field(default=50, ge=1, le=300)
-    batch_size: int = Field(default=32, ge=8, le=256)
-    lr: float = Field(default=1e-3, gt=0)
+    epochs: int = Field(default=100, ge=1, le=500)
+    batch_size: int = Field(default=64, ge=8, le=256)
+    lr: float = Field(default=2e-4, gt=0)
     seq_len: int = Field(default=SEQUENCE_LEN, ge=10, le=200)
+    use_class_weights: bool = Field(
+        default=True,
+        description=(
+            "Use inverse-frequency class weighting to fight HOLD dominance. "
+            "Disable (false) if BUY recall is collapsing — sometimes letting "
+            "the data's natural imbalance through gives a more confident model."
+        ),
+    )
 
 
 class PredictRequest(BaseModel):
@@ -88,6 +96,7 @@ async def train_model(
                 epochs=body.epochs,
                 batch_size=body.batch_size,
                 lr=body.lr,
+                use_class_weights=body.use_class_weights,
             )
             import json
 
@@ -130,6 +139,7 @@ async def train_model_sync(
         epochs=body.epochs,
         batch_size=body.batch_size,
         lr=body.lr,
+        use_class_weights=body.use_class_weights,
     )
     return result
 
@@ -186,7 +196,7 @@ class WalkForwardRequest(BaseModel):
     n_splits:        int       = Field(default=5, ge=2, le=10)
     epochs:          int       = Field(default=30, ge=1, le=200)
     batch_size:      int       = Field(default=32, ge=8, le=256)
-    lr:              float     = Field(default=1e-3, gt=0)
+    lr:              float     = Field(default=1e-4, gt=0)
 
 
 @router.post("/walkforward")

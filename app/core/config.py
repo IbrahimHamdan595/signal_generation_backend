@@ -30,9 +30,9 @@ class Settings(BaseSettings):
     TICKER_LIST_PATH: str = "data/sp500.json"
     MAX_BARS_TO_ENTRY: int = 30
     # Triple-barrier labeling
-    LOOKAHEAD_WINDOW: int = 5    # max bars to look ahead — shorter = less HOLD starvation
-    BUY_THRESHOLD: float = 0.015 # +1.5% triggers BUY label
-    SELL_THRESHOLD: float = 0.015 # -1.5% triggers SELL label (symmetric for balanced classes)
+    LOOKAHEAD_WINDOW: int = 5    # 5 bars ≈ 1 week — short enough to be predictable from momentum
+    BUY_THRESHOLD: float = 0.015 # +1.5% triggers BUY — lower threshold = more signal at 5-bar horizon
+    SELL_THRESHOLD: float = 0.015 # -1.5% triggers SELL
 
     @model_validator(mode="after")
     def validate_required(self) -> "Settings":

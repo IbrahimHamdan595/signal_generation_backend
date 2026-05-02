@@ -130,6 +130,7 @@ async def build_daily_sentiment(
                 "total": total,
                 "done": n_ok,
                 "failed": n_fail,
+                "completed": success,   # live list — lets resume read mid-job progress
             })
 
         try:
@@ -144,6 +145,7 @@ async def build_daily_sentiment(
                 "total": len(body.tickers),
                 "success": success,
                 "failed_tickers": failed,
+                "completed": success,
             })
             logger.info(f"Daily sentiment build done — success: {success}, failed: {failed}")
         except Exception as e:
@@ -218,6 +220,19 @@ async def get_snapshot_history(
     return [SentimentSnapshotResponse(**d) for d in docs]
 
 
+@router.get("/daily/tickers")
+async def get_daily_sentiment_tickers(
+    pool=Depends(get_db),
+    current_user=Depends(get_current_active_user),
+):
+    """Returns list of tickers that have at least one row in daily_sentiment."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT DISTINCT ticker FROM daily_sentiment ORDER BY ticker"
+        )
+    return [r["ticker"] for r in rows]
+
+
 @router.get("/summary", response_model=List[SentimentSummaryResponse])
 async def get_all_summaries(
     pool=Depends(get_db),
@@ -228,9 +243,9 @@ async def get_all_summaries(
         SentimentSummaryResponse(
             ticker=d["ticker"],
             avg_compound=d.get("avg_compound", 0.0),
-            avg_positive=d.get("avg_positive", 0.0),
-            avg_negative=d.get("avg_negative", 0.0),
-            avg_neutral=d.get("avg_neutral", 0.0),
+            dominant_sentiment=d.get("dominant_sentiment", "neutral"),
+            article_count=d.get("article_count", 0),
+            latest_article_at=d.get("latest_article_at"),
         )
         for d in docs
     ]
@@ -248,7 +263,7 @@ async def get_ticker_summary(
     return SentimentSummaryResponse(
         ticker=doc["ticker"],
         avg_compound=doc.get("avg_compound", 0.0),
-        avg_positive=doc.get("avg_positive", 0.0),
-        avg_negative=doc.get("avg_negative", 0.0),
-        avg_neutral=doc.get("avg_neutral", 0.0),
+        dominant_sentiment=doc.get("dominant_sentiment", "neutral"),
+        article_count=doc.get("article_count", 0),
+        latest_article_at=doc.get("latest_article_at"),
     )

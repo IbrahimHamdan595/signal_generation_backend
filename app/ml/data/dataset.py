@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 import asyncpg
 import logging
 
@@ -68,47 +68,58 @@ FEATURE_COLS = OHLCV_COLS + INDICATOR_COLS
 SEQUENCE_LEN = 60
 
 REGRESSION_TARGETS = [
-    "entry_price",
-    "stop_loss",
-    "take_profit",
-    "net_profit",
-    "bars_to_entry",
+    "entry_price",    # [0] % offset from current close → convert to $ at inference
+    "stop_loss",      # [1] signed % from entry
+    "take_profit",    # [2] signed % from entry
+    "net_profit",     # [3] net reward-risk %
+    "bars_to_entry",  # [4] predicted bars until entry fills
 ]
 
+# Separate discrete timing head: cleaner CE loss than regressing a float
+#   0=bar+1  1=bar+2  2=bar+3  3=no-fill/HOLD
+TIMING_BUCKETS = 4
+ENTRY_WINDOW   = 3  # short forward window for entry labels (learnable from momentum)
 
 
-def compute_optimal_entry_bar(
-    current_idx: int, closes: np.ndarray, label: int, lookahead_window: int = None
-) -> float:
-    if lookahead_window is None:
-        lookahead_window = settings.LOOKAHEAD_WINDOW
 
-    if label == 0:
-        return 0.0
+def compute_entry_labels(
+    current_close: float,
+    label: int,
+    early_window: np.ndarray,  # closes[i+1 .. i+1+ENTRY_WINDOW]
+) -> tuple:
+    """
+    Compute (entry_offset_pct, bars_to_entry_float, timing_class) using only
+    a tight ENTRY_WINDOW (3-bar) forward look — narrow enough that current-bar
+    momentum / volatility carries genuine predictive signal.
 
-    end_idx = min(current_idx + lookahead_window + 1, len(closes))
-    future_prices = closes[current_idx:end_idx]
+    entry_offset_pct:
+        BUY  → % offset to the lowest close in the window (negative = buy dip)
+        SELL → % offset to the highest close in the window (positive = sell spike)
+        HOLD → 0.0
 
-    if len(future_prices) < 2:
-        return 1.0
+    bars_to_entry_float:
+        Index (1-based) of the optimal bar within the window. HOLD → 0.0.
 
-    current_price = closes[current_idx]
+    timing_class (int 0-3):
+        0 = bar+1, 1 = bar+2, 2 = bar+3, 3 = HOLD/no-fill
+        Mirrors bars_to_entry as a discrete class for the timing head.
+    """
+    if label == 0 or len(early_window) == 0:
+        return 0.0, 0.0, 3  # HOLD
 
-    if label == 1:
-        optimal_idx = np.argmin(future_prices)
-    elif label == 2:
-        optimal_idx = np.argmax(future_prices)
-    else:
-        return 0.0
+    if label == 1:          # BUY — target the dip
+        idx = int(np.argmin(early_window))
+    else:                   # SELL — target the spike
+        idx = int(np.argmax(early_window))
 
-    optimal_price = future_prices[optimal_idx]
+    best_price       = float(early_window[idx])
+    entry_offset_pct = (best_price - current_close) / current_close
+    # Clip: 2% max — prevents rare gap-opens from dominating MSE
+    entry_offset_pct = float(np.clip(entry_offset_pct, -0.02, 0.02))
+    bars_to_entry    = float(idx + 1)          # 1-based bar offset
+    timing_class     = min(idx, TIMING_BUCKETS - 2)  # cap at class 2
 
-    if optimal_price == current_price:
-        return 0.0
-
-    bars = float(optimal_idx)
-    bars = max(0.0, min(bars, float(lookahead_window)))
-    return bars
+    return entry_offset_pct, bars_to_entry, timing_class
 
 
 class DatasetBuilder:
@@ -120,27 +131,26 @@ class DatasetBuilder:
         tickers: List[str],
         interval: str = "1d",
         sequence_len: int = SEQUENCE_LEN,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict]:
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict]:
         """
         Build the full dataset with per-ticker Z-score normalisation.
-        Each ticker gets its own mean/std computed on its own sequences only,
-        preventing price-level contamination between different stocks.
+        Returns (X_price, X_sentiment, y_class, y_regression, y_timing, scaler_params).
         scaler_params is a dict  ticker → {mean: [...], std: [...]}.
         """
-        all_price, all_sent, all_cls, all_reg = [], [], [], []
+        all_price, all_sent, all_cls, all_reg, all_timing = [], [], [], [], []
         scaler_params: dict = {}
 
         for ticker in tickers:
             try:
-                p, s, c, r = await self._build_ticker(ticker, interval, sequence_len)
+                p, s, c, r, t = await self._build_ticker(ticker, interval, sequence_len)
                 if p is not None and len(p) > 0:
-                    # ── Per-ticker normalisation ──────────────────────────────
                     p_norm, t_scaler = self._normalise(p)
                     scaler_params[ticker] = t_scaler
                     all_price.append(p_norm)
                     all_sent.append(s)
                     all_cls.append(c)
                     all_reg.append(r)
+                    all_timing.append(t)
                     logger.info(f"✅ {ticker}: {len(p)} sequences")
             except Exception as e:
                 logger.error(f"❌ {ticker}: {e}")
@@ -148,10 +158,11 @@ class DatasetBuilder:
         if not all_price:
             raise ValueError("No data built — run ingest + sentiment fetch first.")
 
-        X_price = np.concatenate(all_price, axis=0).astype(np.float32)
-        X_sentiment = np.concatenate(all_sent, axis=0).astype(np.float32)
-        y_class = np.concatenate(all_cls, axis=0).astype(np.int64)
-        y_regression = np.concatenate(all_reg, axis=0).astype(np.float32)
+        X_price      = np.concatenate(all_price,  axis=0).astype(np.float32)
+        X_sentiment  = np.concatenate(all_sent,   axis=0).astype(np.float32)
+        y_class      = np.concatenate(all_cls,    axis=0).astype(np.int64)
+        y_regression = np.concatenate(all_reg,    axis=0).astype(np.float32)
+        y_timing_out = np.concatenate(all_timing, axis=0).astype(np.int64)
 
         logger.info(
             f"✅ Dataset: {X_price.shape[0]} sequences | "
@@ -159,7 +170,7 @@ class DatasetBuilder:
             f"Sell={int((y_class == 2).sum())} "
             f"Hold={int((y_class == 0).sum())}"
         )
-        return X_price, X_sentiment, y_class, y_regression, scaler_params
+        return X_price, X_sentiment, y_class, y_regression, y_timing_out, scaler_params
 
     async def _build_ticker(self, ticker: str, interval: str, sequence_len: int):
         async with self.pool.acquire() as conn:
@@ -176,7 +187,7 @@ class DatasetBuilder:
 
         if len(ohlcv_rows) < sequence_len + settings.LOOKAHEAD_WINDOW + 1:
             logger.warning(f"⚠️  {ticker}: not enough rows ({len(ohlcv_rows)})")
-            return None, None, None, None
+            return None, None, None, None, None
 
         async with self.pool.acquire() as conn:
             ind_rows = await conn.fetch(
@@ -302,9 +313,8 @@ class DatasetBuilder:
         prices     = df[FEATURE_COLS].values
         closes     = df["close"].values
         timestamps = df["timestamp"].values
-        atrs       = df["atr_14"].values if "atr_14" in df.columns else np.zeros(len(df))
 
-        X_price, X_sent, y_cls, y_reg = [], [], [], []
+        X_price, X_sent, y_cls, y_reg, y_timing = [], [], [], [], []
 
         lookahead   = settings.LOOKAHEAD_WINDOW
         buy_thresh  = settings.BUY_THRESHOLD
@@ -314,7 +324,6 @@ class DatasetBuilder:
         for i in range(sequence_len, len(df) - lookahead):
             window        = prices[i - sequence_len : i]
             current_close = closes[i]
-            atr           = atrs[i] if atrs[i] > 0 else current_close * 0.02
 
             # Per-bar sentiment vector — priority: daily_sentiment > social_col > global
             if has_daily:
@@ -355,58 +364,77 @@ class DatasetBuilder:
                     label = 2   # SELL — lower barrier hit first
                     break
 
-            # ── Regression targets as % deviations from entry ────────────────
-            # Storing absolute prices (e.g. NVDA ~$900) causes regression
-            # gradients that are ~1000× larger than classification gradients,
-            # collapsing the model to predict only one class.
-            # Solution: all price targets are stored as decimal % of entry.
-            #   entry_price  = 0.0  (always — "no deviation from current close")
-            #   stop_loss    = negative % (e.g. -0.015 = 1.5% below entry)
-            #   take_profit  = positive % (e.g. +0.030 = 3.0% above entry)
-            #   net_profit   = TP% + SL% combined
-            # At inference time, multiply by current price to recover dollars.
+            # ── Regression targets — all as % deviations from current close ──
+            # All price-level targets stored as decimal % so gradients stay in
+            # the same range as classification loss. Multiply by current_close
+            # at inference to recover dollar values.
             entry = current_close
             if entry <= 0:
                 continue
 
             if label == 1:  # BUY
-                tp_abs      = float(np.max(future_closes)) if len(future_closes) > 0 else entry * (1 + buy_thresh)
-                sl_abs      = float(np.min(future_closes)) if len(future_closes) > 0 else entry * (1 - sell_thresh)
-                tp_pct      = (tp_abs - entry) / entry          # e.g. +0.03
-                sl_pct      = (sl_abs - entry) / entry          # e.g. -0.015
-                net_pct     = tp_pct + sl_pct                   # net reward-risk %
+                tp_abs  = float(np.max(future_closes)) if len(future_closes) > 0 else entry * (1 + buy_thresh)
+                sl_abs  = float(np.min(future_closes)) if len(future_closes) > 0 else entry * (1 - sell_thresh)
+                tp_pct  = (tp_abs - entry) / entry
+                sl_pct  = (sl_abs - entry) / entry
+                net_pct = tp_pct + sl_pct
             elif label == 2:  # SELL
-                tp_abs      = float(np.min(future_closes)) if len(future_closes) > 0 else entry * (1 - sell_thresh)
-                sl_abs      = float(np.max(future_closes)) if len(future_closes) > 0 else entry * (1 + buy_thresh)
-                tp_pct      = (entry - tp_abs) / entry          # positive for SELL
-                sl_pct      = (entry - sl_abs) / entry          # negative for SELL
-                net_pct     = tp_pct + sl_pct
-            else:  # HOLD
-                tp_pct      = atr / entry if entry > 0 else 0.01
-                sl_pct      = -atr / entry if entry > 0 else -0.01
-                net_pct     = 0.0
+                tp_abs  = float(np.min(future_closes)) if len(future_closes) > 0 else entry * (1 - sell_thresh)
+                sl_abs  = float(np.max(future_closes)) if len(future_closes) > 0 else entry * (1 + buy_thresh)
+                tp_pct  = (entry - tp_abs) / entry
+                sl_pct  = (entry - sl_abs) / entry
+                net_pct = tp_pct + sl_pct
+            else:  # HOLD — no trade
+                tp_pct  = 0.0
+                sl_pct  = 0.0
+                net_pct = 0.0
 
-            bars_to_entry = compute_optimal_entry_bar(i, closes, label)
+            # ── Entry price + timing — use tight 3-bar window ────────────────
+            # Short window (ENTRY_WINDOW=3 bars) so current-bar momentum /
+            # volatility carries genuine predictive signal. Full-lookahead
+            # argmin was unpredictable hindsight; next 3 bars is learnable.
+            early_window = closes[i + 1 : i + 1 + ENTRY_WINDOW]
+            entry_offset_pct, bars_to_entry, timing_class = compute_entry_labels(
+                current_close, label, early_window
+            )
 
             X_price.append(window)
             X_sent.append(sent_vec)
             y_cls.append(label)
-            # [0]=entry(always 0.0), [1]=sl_pct, [2]=tp_pct, [3]=net_pct, [4]=bars
-            y_reg.append([0.0, sl_pct, tp_pct, net_pct, bars_to_entry])
+            # [0]=entry_offset_pct  [1]=sl_pct  [2]=tp_pct  [3]=net_pct  [4]=bars
+            y_reg.append([entry_offset_pct, sl_pct, tp_pct, net_pct, bars_to_entry])
+            y_timing.append(timing_class)
 
         return (
-            np.array(X_price, dtype=np.float32),
-            np.array(X_sent, dtype=np.float32),
-            np.array(y_cls, dtype=np.int64),
-            np.array(y_reg, dtype=np.float32),
+            np.array(X_price,  dtype=np.float32),
+            np.array(X_sent,   dtype=np.float32),
+            np.array(y_cls,    dtype=np.int64),
+            np.array(y_reg,    dtype=np.float32),
+            np.array(y_timing, dtype=np.int64),
         )
 
-    def _normalise(self, X: np.ndarray) -> Tuple[np.ndarray, dict]:
+    def _normalise(
+        self,
+        X: np.ndarray,
+        fit_slice: Optional[Tuple[int, int]] = None,
+    ) -> Tuple[np.ndarray, dict]:
+        """
+        Z-score normalise X using statistics computed from a slice (typically
+        the chronological train portion only) — prevents val/test data from
+        leaking into the scaler, which previously made the gen-gap invisible.
+
+        fit_slice = (start, end) of the rows used to FIT mean/std; transform
+        is then applied to the entire array. If None, fits on the full array
+        (legacy behaviour).
+        """
         N, T, F = X.shape
-        X_flat = X.reshape(-1, F)
-        mean = X_flat.mean(axis=0)
-        std = X_flat.std(axis=0) + 1e-8
-        return (X_flat - mean).reshape(N, T, F) / std, {
-            "mean": mean.tolist(),
-            "std": std.tolist(),
-        }
+        if fit_slice is None:
+            fit_data = X.reshape(-1, F)
+        else:
+            s, e = fit_slice
+            fit_data = X[s:e].reshape(-1, F) if e > s else X.reshape(-1, F)
+
+        mean = fit_data.mean(axis=0)
+        std = fit_data.std(axis=0) + 1e-8
+        X_norm = (X.reshape(-1, F) - mean).reshape(N, T, F) / std
+        return X_norm, {"mean": mean.tolist(), "std": std.tolist()}

@@ -58,6 +58,11 @@ class SignalService:
             except ValueError:
                 logger.warning(f"[{ticker}] Could not parse entry_time: {result['entry_time']!r}")
 
+        predicted  = result.get("predicted", {})
+        timing     = result.get("timing", {})
+        bucket     = timing.get("bucket")
+        bucket_label = timing.get("bucket_label")
+
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
@@ -65,8 +70,31 @@ class SignalService:
                     ticker, interval, action, confidence,
                     entry_price, stop_loss, take_profit, net_profit,
                     bars_to_entry, entry_time, entry_time_label,
-                    prob_buy, prob_sell, prob_hold, source, created_at
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+                    prob_buy, prob_sell, prob_hold,
+                    entry_offset_pct, timing_bucket, timing_bucket_label,
+                    source, created_at
+                ) VALUES (
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+                    $12, $13, $14, $15, $16, $17, $18, $19
+                )
+                ON CONFLICT (ticker, interval, DATE(created_at AT TIME ZONE 'UTC'))
+                DO UPDATE SET
+                    action             = EXCLUDED.action,
+                    confidence         = EXCLUDED.confidence,
+                    entry_price        = EXCLUDED.entry_price,
+                    stop_loss          = EXCLUDED.stop_loss,
+                    take_profit        = EXCLUDED.take_profit,
+                    net_profit         = EXCLUDED.net_profit,
+                    bars_to_entry      = EXCLUDED.bars_to_entry,
+                    entry_time         = EXCLUDED.entry_time,
+                    entry_time_label   = EXCLUDED.entry_time_label,
+                    prob_buy           = EXCLUDED.prob_buy,
+                    prob_sell          = EXCLUDED.prob_sell,
+                    prob_hold          = EXCLUDED.prob_hold,
+                    entry_offset_pct   = EXCLUDED.entry_offset_pct,
+                    timing_bucket      = EXCLUDED.timing_bucket,
+                    timing_bucket_label = EXCLUDED.timing_bucket_label,
+                    created_at         = EXCLUDED.created_at
                 RETURNING *
                 """,
                 ticker,
@@ -83,6 +111,9 @@ class SignalService:
                 result.get("probabilities", {}).get("buy"),
                 result.get("probabilities", {}).get("sell"),
                 result.get("probabilities", {}).get("hold"),
+                predicted.get("entry_offset_pct"),
+                bucket,
+                bucket_label,
                 "ml_model",
                 datetime.now(timezone.utc),
             )

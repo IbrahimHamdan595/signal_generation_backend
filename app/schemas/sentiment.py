@@ -13,7 +13,7 @@ class SentimentFetchRequest(BaseModel):
 # ── Article Response ──────────────────────────────────────────────────────────
 
 class SentimentArticleResponse(BaseModel):
-    id: str
+    id: int
     ticker: str
     title: str
     description: Optional[str] = None
@@ -32,8 +32,8 @@ class SentimentArticleResponse(BaseModel):
 
 class SentimentSnapshotResponse(BaseModel):
     ticker: str
-    window_start: datetime
-    window_end: datetime
+    window_start: Optional[datetime] = None
+    window_end: Optional[datetime] = None
     article_count: int
     avg_positive: float
     avg_negative: float

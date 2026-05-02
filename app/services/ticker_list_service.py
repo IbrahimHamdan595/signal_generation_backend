@@ -7,20 +7,6 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_TICKERS = [
-    "AAPL",
-    "MSFT",
-    "GOOGL",
-    "AMZN",
-    "NVDA",
-    "META",
-    "TSLA",
-    "JPM",
-    "V",
-    "NFLX",
-]
-
-
 class TickerListService:
     def __init__(self):
         self._cached_tickers: Optional[List[str]] = None
@@ -37,11 +23,9 @@ class TickerListService:
         path = Path(settings.TICKER_LIST_PATH)
 
         if not path.exists():
-            logger.error(
-                f"❌ Ticker list not found: {path}, falling back to DEFAULT_TICKERS"
-            )
-            self._cached_tickers = DEFAULT_TICKERS
-            return DEFAULT_TICKERS
+            logger.warning(f"⚠️  Ticker list not found: {path}")
+            self._cached_tickers = []
+            return []
 
         try:
             with open(path, "r") as f:
@@ -57,28 +41,22 @@ class TickerListService:
                     for item in data["tickers"]
                 ]
             else:
-                logger.error(
-                    "❌ Invalid sp500.json format, falling back to DEFAULT_TICKERS"
-                )
-                self._cached_tickers = DEFAULT_TICKERS
-                return DEFAULT_TICKERS
+                logger.error("❌ Invalid sp500.json format")
+                self._cached_tickers = []
+                return []
 
             self._cached_tickers = tickers
             logger.info(f"✅ Loaded {len(tickers)} tickers from {path}")
             return tickers
 
         except json.JSONDecodeError as e:
-            logger.error(
-                f"❌ Failed to parse {path}: {e}, falling back to DEFAULT_TICKERS"
-            )
-            self._cached_tickers = DEFAULT_TICKERS
-            return DEFAULT_TICKERS
+            logger.error(f"❌ Failed to parse {path}: {e}")
+            self._cached_tickers = []
+            return []
         except Exception as e:
-            logger.error(
-                f"❌ Failed to load ticker list: {e}, falling back to DEFAULT_TICKERS"
-            )
-            self._cached_tickers = DEFAULT_TICKERS
-            return DEFAULT_TICKERS
+            logger.error(f"❌ Failed to load ticker list: {e}")
+            self._cached_tickers = []
+            return []
 
     def set_custom_tickers(self, tickers: List[str]) -> None:
         self._custom_tickers = tickers

@@ -61,21 +61,24 @@ def register_version(
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     versions = _load_version_index()
 
-    # Determine if this is the best model so far
-    best_loss = min((v["val_loss"] for v in versions), default=float("inf"))
+    # Compare only against same architecture version to avoid cross-arch val_loss
+    # comparisons (e.g. 2-layer model blocking a 3-layer retrain from promoting).
+    same_arch = [v for v in versions if v.get("model_version") == "v2"]
+    best_loss = min((v["val_loss"] for v in same_arch), default=float("inf"))
     is_best   = val_loss < best_loss
 
     entry = {
-        "version":    checkpoint_name,
-        "created_at": _timestamp_tag(),
-        "val_loss":   round(val_loss, 6),
-        "val_acc":    round(val_acc, 6),
-        "is_best":    is_best,
-        "tickers":    tickers or [],
-        "sharpe":     round(eval_metrics.get("trading", {}).get("sharpe_ratio", 0.0), 4)
-                      if eval_metrics else None,
-        "accuracy":   round(eval_metrics.get("accuracy", 0.0), 4)
-                      if eval_metrics else None,
+        "version":       checkpoint_name,
+        "created_at":    _timestamp_tag(),
+        "val_loss":      round(val_loss, 6),
+        "val_acc":       round(val_acc, 6),
+        "is_best":       is_best,
+        "tickers":       tickers or [],
+        "model_version": "v2",
+        "sharpe":        round(eval_metrics.get("trading", {}).get("sharpe_ratio", 0.0), 4)
+                         if eval_metrics else None,
+        "accuracy":      round(eval_metrics.get("accuracy", 0.0), 4)
+                         if eval_metrics else None,
     }
 
     # Mark previous best as no longer best
@@ -86,12 +89,12 @@ def register_version(
     versions.append(entry)
     _save_version_index(versions)
 
-    # Promote to canonical best_model.pt
-    if is_best:
-        versioned_path = os.path.join(CHECKPOINT_DIR, checkpoint_name)
-        if os.path.exists(versioned_path):
-            shutil.copy2(versioned_path, MODEL_PATH)
-            logger.info(f"🏆 New best model → {checkpoint_name} (val_loss={val_loss:.4f})")
+    # Always promote the new checkpoint — we just finished a full retrain so this
+    # is the intended active model regardless of val_loss comparison.
+    versioned_path = os.path.join(CHECKPOINT_DIR, checkpoint_name)
+    if os.path.exists(versioned_path):
+        shutil.copy2(versioned_path, MODEL_PATH)
+        logger.info(f"🏆 New best model → {checkpoint_name} (val_loss={val_loss:.4f})")
 
     return entry
 
@@ -133,8 +136,9 @@ def rollback_to(checkpoint_name: str) -> bool:
 
 def save_model_config(config: dict):
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    config_out = {**config, "model_version": "v2"}
     with open(MODEL_CFG_PATH, "w") as f:
-        json.dump(config, f, indent=2)
+        json.dump(config_out, f, indent=2)
     logger.info(f"💾 Model config saved → {MODEL_CFG_PATH}")
 
 
@@ -156,10 +160,21 @@ def load_model() -> Optional[TradingFusionModel]:
     with open(MODEL_CFG_PATH) as f:
         config = json.load(f)
 
+    arch_version = config.get("model_version", "v1")
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model  = TradingFusionModel(**config)
     ckpt   = torch.load(MODEL_PATH, map_location=device, weights_only=True)
-    model.load_state_dict(ckpt["model_state"])
+    try:
+        model.load_state_dict(ckpt["model_state"])
+    except RuntimeError as exc:
+        logger.warning(
+            "⚠️  Saved checkpoint is incompatible with current architecture "
+            f"(model_version={arch_version}, expected v2). Retrain required. "
+            f"Details: {exc}"
+        )
+        _model_instance = None
+        return None
     model.to(device)
     model.eval()
     _model_instance = model

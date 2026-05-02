@@ -54,11 +54,14 @@ class SentimentService:
 
         for i, ticker in enumerate(tickers):
             try:
+                t = ticker.upper()
                 if recent_limit is not None:
-                    count = await self._ingest_recent(ticker.upper(), recent_limit)
+                    count = await self._ingest_recent(t, recent_limit)
                 else:
-                    count = await self._ingest_full_history(ticker.upper(), years)
-                success.append(ticker.upper())
+                    # articles: ON CONFLICT DO NOTHING — same URL never inserted twice
+                    # FinBERT: only scores rows where sentiment_label IS NULL — no re-scoring
+                    count = await self._ingest_full_history(t, years)
+                success.append(t)
                 total_count += count
                 unit = "articles" if recent_limit is not None else "days"
                 logger.info(f"✅ Sentiment done for {ticker}: {count} {unit}")

@@ -40,8 +40,8 @@ class WatchlistUpdate(BaseModel):
 # ── OHLCV ─────────────────────────────────────────────────────────────────────
 
 class OHLCVResponse(BaseModel):
-    ticker: str
-    interval: str
+    ticker: Optional[str] = None
+    interval: Optional[str] = None
     timestamp: datetime
     open: float
     high: float
@@ -119,6 +119,7 @@ class IngestResponse(BaseModel):
     failed: List[str]
     total_records: int
     message: str
+    failed_details: List[dict] = []
 
 
 # ── Generic ───────────────────────────────────────────────────────────────────

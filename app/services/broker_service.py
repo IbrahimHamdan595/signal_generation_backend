@@ -182,25 +182,92 @@ class BrokerService:
     # ── Symbol helpers ────────────────────────────────────────────────────────
 
     async def get_symbol_info(self, symbol: str) -> Optional[dict]:
-        """Return contract spec needed for position sizing."""
+        """Return contract spec needed for position sizing.
+        Tries exact match first, then searches broker catalog by ticker pattern
+        so brokers that use full names (e.g. 'Apple' for 'AAPL') still work
+        for any ticker without a hardcoded mapping.
+        """
         def _sym():
             mt5 = _import_mt5()
+
+            def _build(info):
+                mt5.symbol_select(info.name, True)
+                return {
+                    "symbol":          info.name,
+                    "contract_size":   info.trade_contract_size,
+                    "volume_min":      info.volume_min,
+                    "volume_max":      info.volume_max,
+                    "volume_step":     info.volume_step,
+                    "point":           info.point,
+                    "digits":          info.digits,
+                    "currency_base":   info.currency_base,
+                    "currency_profit": info.currency_profit,
+                }
+
+            # 1. Exact match
+            mt5.symbol_select(symbol, True)
             info = mt5.symbol_info(symbol)
-            if info is None:
-                return None
-            return {
-                "symbol":        info.name,
-                "contract_size": info.trade_contract_size,   # units per lot
-                "volume_min":    info.volume_min,
-                "volume_max":    info.volume_max,
-                "volume_step":   info.volume_step,
-                "point":         info.point,
-                "digits":        info.digits,
-                "currency_base": info.currency_base,
-                "currency_profit": info.currency_profit,
-            }
+            if info is not None:
+                return _build(info)
+
+            # 2. Search broker catalog — ticker appears in category field
+            #    e.g. broker stores 'Apple' with category 'AAPL.OQ'
+            all_symbols = mt5.symbols_get()
+            if all_symbols:
+                ticker_upper = symbol.upper()
+                for s in all_symbols:
+                    category = (s.category or "").upper()
+                    name     = (s.name or "").upper()
+                    if category.startswith(ticker_upper) or name == ticker_upper:
+                        return _build(s)
+
+            return None
 
         return await _run(_sym)
+
+    async def validate_symbols(
+        self, tickers: list[str], suffix: str = ""
+    ) -> tuple[list[str], list[str]]:
+        """
+        Check which tickers exist in MT5.
+        Returns (valid_tickers, invalid_tickers).
+        valid_tickers are the original ticker strings that resolved successfully.
+        """
+        def _validate():
+            mt5 = _import_mt5()
+            all_symbols = mt5.symbols_get()
+            symbol_names  = set()
+            symbol_cats   = {}
+            if all_symbols:
+                for s in all_symbols:
+                    symbol_names.add((s.name or "").upper())
+                    cat = (s.category or "").upper()
+                    if cat:
+                        symbol_cats[cat] = s.name
+
+            valid, invalid = [], []
+            for ticker in tickers:
+                candidate = (ticker + suffix).upper()
+                # 1. Exact match (with suffix)
+                if candidate in symbol_names:
+                    valid.append(ticker)
+                    continue
+                # 2. Exact match (without suffix)
+                if ticker.upper() in symbol_names:
+                    valid.append(ticker)
+                    continue
+                # 3. Category match (e.g. AAPL.OQ → Apple)
+                found = False
+                for cat in symbol_cats:
+                    if cat.startswith(ticker.upper()):
+                        valid.append(ticker)
+                        found = True
+                        break
+                if not found:
+                    invalid.append(ticker)
+            return valid, invalid
+
+        return await _run(_validate)
 
     async def current_price(self, symbol: str, side: str) -> Optional[float]:
         """
@@ -212,7 +279,8 @@ class BrokerService:
             tick = mt5.symbol_info_tick(symbol)
             if tick is None:
                 return None
-            return tick.ask if side == "BUY" else tick.bid
+            price = tick.ask if side == "BUY" else tick.bid
+            return price if price > 0 else None
 
         return await _run(_price)
 

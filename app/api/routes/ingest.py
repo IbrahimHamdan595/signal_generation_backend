@@ -24,7 +24,7 @@ async def ingest(
         raise HTTPException(400, "Max 50 tickers per request")
 
     svc = OHLCVService(pool)
-    success, failed, total = await svc.ingest_tickers(
+    success, failed, total, failed_details = await svc.ingest_tickers(
         body.tickers, body.interval, body.period
     )
 
@@ -33,6 +33,7 @@ async def ingest(
         failed=failed,
         total_records=total,
         message=f"Ingested {total} records for {len(success)} tickers",
+        failed_details=failed_details,
     )
 
 
@@ -58,20 +59,24 @@ async def ingest_background(
         log = logging.getLogger(__name__)
         ohlcv_svc = OHLCVService(pool)
         success, failed = [], []
+        failed_details: list[dict] = []
         total_records = 0
+
         try:
             for i, ticker in enumerate(body.tickers):
+                t = ticker.upper()
                 try:
-                    count = await ohlcv_svc._ingest_single(
-                        ticker.upper(), body.interval, body.period
-                    )
-                    success.append(ticker.upper())
+                    # ON CONFLICT DO UPDATE — same bar overwrites itself, no duplicates
+                    count = await ohlcv_svc._ingest_single(t, body.interval, body.period)
+                    success.append(t)
                     total_records += count
-                except Exception as e:
-                    log.error(f"❌ Ingest failed for {ticker.upper()}: {e}", exc_info=True)
-                    failed.append(ticker.upper())
+                    log.info(f"✅ {t}: {count} bars upserted")
 
-                # Update progress after each ticker
+                except Exception as e:
+                    log.error(f"❌ Ingest failed for {t}: {e}", exc_info=True)
+                    failed.append(t)
+                    failed_details.append({"ticker": t, "error": str(e)})
+
                 await job_svc.update_progress(job_id, {
                     "done": len(success),
                     "failed": len(failed),
@@ -87,6 +92,7 @@ async def ingest_background(
                 "total_records": total_records,
                 "success": success,
                 "failed_tickers": failed,
+                "failed_details": failed_details,
             })
         except Exception as e:
             await job_svc.fail(job_id, str(e))

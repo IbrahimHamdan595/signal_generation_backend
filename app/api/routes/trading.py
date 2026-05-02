@@ -23,6 +23,8 @@ from app.core.security import get_current_active_user
 from app.db.database import get_db
 from app.services.broker_service import BrokerService
 from app.services.execution_service import ExecutionService
+from app.services.signal_service import SignalService
+from app.services.ohlcv_service import OHLCVService
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/trading", tags=["Trading"])
@@ -46,7 +48,7 @@ class TradingConfigUpdate(BaseModel):
     risk_per_trade_pct: Optional[float] = Field(None, ge=0.1, le=10.0)
     max_open_positions: Optional[int]   = Field(None, ge=1, le=50)
     max_daily_loss_pct: Optional[float] = Field(None, ge=0.5, le=20.0)
-    min_confidence:     Optional[float] = Field(None, ge=0.5, le=1.0)
+    min_confidence:     Optional[float] = Field(None, ge=0.3, le=1.0)
     allowed_actions:    Optional[List[str]] = None
     mt5_account:        Optional[int]   = None
     mt5_server:         Optional[str]   = None
@@ -179,9 +181,16 @@ async def update_config(
     return config
 
 
+class ExecuteRequest(BaseModel):
+    volume: Optional[float] = Field(
+        None, gt=0, description="Override lot size. Omit to use auto position-sizing."
+    )
+
+
 @router.post("/execute/{signal_id}")
 async def execute_signal(
     signal_id: int,
+    body: ExecuteRequest = ExecuteRequest(),
     pool=Depends(get_db),
     current_user=Depends(get_current_active_user),
 ):
@@ -189,13 +198,14 @@ async def execute_signal(
     Manually execute a specific signal.
     Runs all risk checks (daily loss limit, max positions, stop-loss required)
     and places a market order via MT5.
+    Pass `volume` in the request body to override auto position-sizing.
     """
     broker = BrokerService()
     if not await broker.is_connected():
         raise HTTPException(400, "MT5 not connected — call POST /trading/connect first")
 
     exec_svc = ExecutionService(pool, broker)
-    result = await exec_svc.execute_signal(signal_id, current_user["id"])
+    result = await exec_svc.execute_signal(signal_id, current_user["id"], volume_override=body.volume)
 
     if not result["ok"]:
         raise HTTPException(400, result["error"])
@@ -232,12 +242,68 @@ async def close_position(
     return result
 
 
-@router.get("/executions")
-async def get_executions(
-    limit: int = 50,
+@router.post("/run-now")
+async def run_now(
     pool=Depends(get_db),
     current_user=Depends(get_current_active_user),
 ):
-    """Return execution history (orders sent to MT5) for the current user."""
+    """
+    Manually trigger signal regeneration then immediately auto-execute
+    any BUY/SELL signals for the current user.
+    Requires MT5 to be connected and auto_trade = TRUE.
+    """
+    broker = BrokerService()
+    if not await broker.is_connected():
+        raise HTTPException(400, "MT5 not connected — call POST /trading/connect first")
+
+    exec_svc = ExecutionService(pool, broker)
+    config = await exec_svc.get_config(current_user["id"])
+    if not config or not config.get("enabled"):
+        raise HTTPException(400, "Trading not enabled — configure it first")
+    if not config.get("auto_trade"):
+        raise HTTPException(400, "Auto-trade is off — enable it in Risk Configuration")
+
+    # 1. Get tracked tickers
+    ohlcv_svc = OHLCVService(pool)
+    tickers = await ohlcv_svc.get_available_tickers()
+    if not tickers:
+        raise HTTPException(400, "No tickers in database — add tickers to your watchlist first")
+
+    # 2. Validate which tickers exist on this broker
+    suffix = config.get("symbol_suffix") or ""
+    valid_tickers, invalid_tickers = await broker.validate_symbols(tickers, suffix)
+    if not valid_tickers:
+        raise HTTPException(400, "None of your tracked tickers are available on this MT5 broker")
+
+    # 3. Regenerate signals only for broker-valid tickers
+    signal_svc = SignalService(pool)
+    signals = await signal_svc.generate_batch(valid_tickers, "1d")
+
+    # 4. Auto-execute new signals
+    results = await exec_svc.auto_execute(current_user["id"])
+    filled = [r for r in results if r.get("ok")]
+    failed = [r for r in results if not r.get("ok")]
+
+    return {
+        "signals_generated": len(signals),
+        "orders_attempted": len(results),
+        "orders_filled": len(filled),
+        "orders_failed": len(failed),
+        "skipped_tickers": invalid_tickers,
+        "filled": filled,
+        "failed": failed,
+    }
+
+
+@router.get("/executions")
+async def get_executions(
+    limit: int = 20,
+    offset: int = 0,
+    pool=Depends(get_db),
+    current_user=Depends(get_current_active_user),
+):
+    """Return paginated execution history for the current user."""
     exec_svc = ExecutionService(pool, BrokerService())
-    return await exec_svc.get_executions(current_user["id"], limit=min(limit, 200))
+    return await exec_svc.get_executions(
+        current_user["id"], limit=min(limit, 100), offset=offset
+    )

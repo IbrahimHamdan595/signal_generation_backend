@@ -4,13 +4,13 @@ import torch.nn as nn
 
 class MLPHead(nn.Module):
     """
-    Dual-output MLP prediction head.
+    Triple-output MLP prediction head.
 
     Input : fused embedding (batch, fusion_dim)
-    Output:
-        logits     : (batch, 3)  — Buy / Sell / Hold classification
-        regression : (batch, 5)  — Entry Price, Stop Loss, Take Profit,
-                                   Net Profit, Bars to Entry
+    Outputs:
+        logits         : (batch, 3)  — Hold/Buy/Sell direction
+        regression     : (batch, 5)  — entry_offset_pct, sl, tp, net, bars_to_entry
+        timing_logits  : (batch, 4)  — entry timing bucket (bar+1/+2/+3/HOLD)
     """
 
     def __init__(
@@ -18,8 +18,9 @@ class MLPHead(nn.Module):
         input_dim:  int,
         hidden_dim: int   = 128,
         dropout:    float = 0.2,
-        n_classes:  int   = 3,    # Buy=1, Sell=2, Hold=0
-        n_targets:  int   = 5,    # entry, sl, tp, net_profit, bars_to_entry
+        n_classes:  int   = 3,    # Hold=0, Buy=1, Sell=2
+        n_targets:  int   = 5,    # entry_offset, sl, tp, net, bars_to_entry
+        n_timing:   int   = 4,    # timing buckets: bar+1, +2, +3, HOLD/no-fill
     ):
         super().__init__()
 
@@ -34,12 +35,19 @@ class MLPHead(nn.Module):
             nn.Dropout(dropout),
         )
 
-        # Classification — raw logits (CrossEntropyLoss handles softmax)
+        # Direction — raw logits (CrossEntropyLoss handles softmax)
         self.classifier = nn.Linear(hidden_dim // 2, n_classes)
 
-        # Regression — linear for continuous targets
+        # Regression — continuous price/timing targets
         self.regressor  = nn.Linear(hidden_dim // 2, n_targets)
+
+        # Timing — discrete entry-bar classification (small separate head)
+        self.timing_head = nn.Sequential(
+            nn.Linear(hidden_dim // 2, hidden_dim // 4),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 4, n_timing),
+        )
 
     def forward(self, x: torch.Tensor):
         h = self.shared(x)
-        return self.classifier(h), self.regressor(h)
+        return self.classifier(h), self.regressor(h), self.timing_head(h)

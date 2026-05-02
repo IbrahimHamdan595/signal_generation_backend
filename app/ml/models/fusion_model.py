@@ -2,9 +2,12 @@ import torch
 import torch.nn as nn
 from app.ml.models.transformer import TransformerEncoder
 from app.ml.models.mlp_head import MLPHead
-from app.ml.data.dataset import FEATURE_COLS, SEQUENCE_LEN
+from app.ml.data.dataset import FEATURE_COLS, SEQUENCE_LEN, TIMING_BUCKETS
 from app.ml.data.entry_time import entry_time_from_bars
 from datetime import datetime, timezone
+
+# Maps discrete timing bucket → bars until entry executes
+_BUCKET_TO_BARS = {0: 1.0, 1: 2.0, 2: 3.0, 3: 1.0}  # bucket 3 = HOLD → default next bar
 
 
 class TradingFusionModel(nn.Module):
@@ -15,14 +18,19 @@ class TradingFusionModel(nn.Module):
         1. TransformerEncoder   → temporal price embedding  Z_T  (d_model,)
         2. Sentiment projection → sentiment embedding       Z_S  (sent_dim,)
         3. Concatenation        → fused vector              Z    (d_model + sent_dim,)
-        4. MLPHead              → classification + regression (5 targets)
+        4. MLPHead              → three heads:
+             a. direction logits  (3)    — Hold/Buy/Sell
+             b. regression        (5)    — entry_offset_pct, sl, tp, net, bars_to_entry
+             c. timing logits     (4)    — entry-bar bucket (bar+1/+2/+3/HOLD)
 
-    Regression targets:
-        [0] entry_price
-        [1] stop_loss
-        [2] take_profit
-        [3] net_profit
-        [4] bars_to_entry   ← predicted bars until optimal entry (≈1.0)
+    All five regression outputs are genuine model predictions:
+        [0] entry_offset_pct  — % offset from current close for limit entry
+        [1] stop_loss_pct     — signed % SL from entry
+        [2] take_profit_pct   — signed % TP from entry
+        [3] net_profit_pct    — net reward-risk %
+        [4] bars_to_entry     — predicted bars until entry executes (1-3)
+
+    entry_time is deterministically derived from bars_to_entry + calendar.
     """
 
     def __init__(
@@ -37,13 +45,13 @@ class TradingFusionModel(nn.Module):
         sent_dim: int = 16,
         mlp_hidden: int = 128,
         dropout: float = 0.1,
-        # Alias parameters accepted from saved configs / tests
+        model_version: str = "v2",   # metadata — ignored at construction
+        # Legacy aliases accepted from saved v1 configs
         price_features: int = None,
         sentiment_features: int = None,
-        num_classes: int = None,  # unused — always 3
-        reg_targets: int = None,  # unused — always 5
+        num_classes: int = None,
+        reg_targets: int = None,
     ):
-        # Resolve aliases
         if price_features is not None:
             n_features = price_features
         if sentiment_features is not None:
@@ -72,14 +80,15 @@ class TradingFusionModel(nn.Module):
             input_dim=fusion_dim,
             hidden_dim=mlp_hidden,
             dropout=dropout,
-            n_targets=5,  # entry, sl, tp, net_profit, bars_to_entry
+            n_targets=5,
+            n_timing=TIMING_BUCKETS,
         )
 
     def forward(self, x_price: torch.Tensor, x_sentiment: torch.Tensor):
-        z_t = self.transformer(x_price)  # (batch, d_model)
-        z_s = self.sentiment_proj(x_sentiment)  # (batch, sent_dim)
-        z = torch.cat([z_t, z_s], dim=-1)  # (batch, fusion_dim)
-        return self.mlp_head(z)  # logits(3), regression(5)
+        z_t = self.transformer(x_price)           # (batch, d_model)
+        z_s = self.sentiment_proj(x_sentiment)     # (batch, sent_dim)
+        z   = torch.cat([z_t, z_s], dim=-1)        # (batch, fusion_dim)
+        return self.mlp_head(z)                    # (dir_logits, regression, timing_logits)
 
     def predict(
         self,
@@ -89,38 +98,47 @@ class TradingFusionModel(nn.Module):
         interval: str = "1d",
     ) -> dict:
         """
-        Inference helper — returns human-readable predictions including
-        the computed entry timestamp based on model-predicted bars_to_entry.
+        Inference helper — all five regression targets are true model predictions.
+        entry_time is derived from predicted bars_to_entry + NYSE calendar.
         """
         self.eval()
         with torch.no_grad():
-            logits, regression = self.forward(x_price, x_sentiment)
+            dir_logits, regression, timing_logits = self.forward(x_price, x_sentiment)
 
-        probs = torch.softmax(logits, dim=-1)
-        labels = torch.argmax(probs, dim=-1)
+        dir_probs      = torch.softmax(dir_logits,    dim=-1)
+        timing_probs   = torch.softmax(timing_logits, dim=-1)
+        labels         = dir_probs.argmax(dim=-1)
+        timing_buckets = timing_probs.argmax(dim=-1)
 
         label_map = {0: "HOLD", 1: "BUY", 2: "SELL"}
+        ts_ref    = current_ts or datetime.now(timezone.utc)
 
-        ts_ref = current_ts or datetime.now(timezone.utc)
-
-        bars_to_entry_list = regression[:, 4].tolist()
-        entry_times = []
-        for bars in bars_to_entry_list:
-            entry_ts = entry_time_from_bars(ts_ref, bars, interval)
-            entry_times.append(entry_ts.isoformat())
+        # Use regression head's continuous bars_to_entry as primary, timing
+        # bucket as secondary signal (shown in API for transparency).
+        reg_bars = regression[:, 4].tolist()
+        entry_times = [
+            entry_time_from_bars(ts_ref, max(bars, 1.0), interval).isoformat()
+            for bars in reg_bars
+        ]
 
         return {
-            "action": [label_map[label.item()] for label in labels],
-            "confidence": probs.max(dim=-1).values.tolist(),
+            "action":     [label_map[lbl.item()] for lbl in labels],
+            "confidence": dir_probs.max(dim=-1).values.tolist(),
             "probabilities": {
-                "hold": probs[:, 0].tolist(),
-                "buy": probs[:, 1].tolist(),
-                "sell": probs[:, 2].tolist(),
+                "hold": dir_probs[:, 0].tolist(),
+                "buy":  dir_probs[:, 1].tolist(),
+                "sell": dir_probs[:, 2].tolist(),
             },
-            "entry_price": regression[:, 0].tolist(),
-            "stop_loss": regression[:, 1].tolist(),
-            "take_profit": regression[:, 2].tolist(),
-            "net_profit": regression[:, 3].tolist(),
-            "bars_to_entry": bars_to_entry_list,
+            # All five regression outputs — genuine model predictions
+            "entry_price":   regression[:, 0].tolist(),  # entry_offset_pct
+            "stop_loss":     regression[:, 1].tolist(),  # sl_pct
+            "take_profit":   regression[:, 2].tolist(),  # tp_pct
+            "net_profit":    regression[:, 3].tolist(),  # net_pct
+            "bars_to_entry": reg_bars,                   # continuous
+            # Timing head output
+            "timing_bucket":      timing_buckets.tolist(),
+            "timing_probs":       timing_probs.tolist(),
+            "timing_bars":        [_BUCKET_TO_BARS[b.item()] for b in timing_buckets],
+            # Derived
             "entry_time": entry_times,
         }

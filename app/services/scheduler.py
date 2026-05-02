@@ -9,9 +9,10 @@ from app.services.ohlcv_service import OHLCVService
 from app.services.sentiment_service import SentimentService
 from app.services.signal_service import SignalService
 from app.services.outcome_service import OutcomeService
-from app.services.ticker_list_service import ticker_list_service
 from app.services.broker_service import BrokerService
 from app.services.execution_service import ExecutionService
+from app.services.reconciliation_service import ReconciliationService
+from app.services.health_monitor import HealthMonitor
 from app.ml.models.registry import is_model_trained
 
 logger = logging.getLogger(__name__)
@@ -56,11 +57,10 @@ async def _get_tracked_tickers() -> list:
         if pool:
             svc = OHLCVService(pool)
             tickers = await svc.get_available_tickers()
-            if tickers:
-                return tickers
+            return tickers or []
     except Exception as e:
-        logger.debug(f"Could not load tickers from DB, falling back to static list: {e}")
-    return await ticker_list_service.get_tickers()
+        logger.debug(f"Could not load tickers from DB: {e}")
+    return []
 
 
 async def regenerate_signals_sp500():
@@ -71,7 +71,10 @@ async def regenerate_signals_sp500():
     logger.info("🔄 Scheduler: S&P 500 signal generation...")
     try:
         pool = await get_db()
-        tickers = await ticker_list_service.get_tickers()
+        tickers = await _get_tracked_tickers()
+        if not tickers:
+            logger.info("⏭  S&P 500 signal regen skipped — no tracked tickers.")
+            return
         svc = SignalService(pool)
 
         logger.info(f"📊 Generating signals for {len(tickers)} S&P 500 tickers...")
@@ -103,8 +106,11 @@ async def refresh_daily_data():
     try:
         pool = await get_db()
         tickers = await _get_tracked_tickers()
+        if not tickers:
+            logger.info("⏭  Daily refresh skipped — no tracked tickers.")
+            return
         svc = OHLCVService(pool)
-        success, failed, count = await svc.ingest_tickers(tickers, "1d", "3mo")
+        success, failed, count = await svc.ingest_tickers(tickers, "1d", "2y")
         logger.info(f"✅ Daily refresh: {count} records | failed: {failed}")
     except Exception as e:
         logger.error(f"❌ Daily refresh error: {e}")
@@ -116,6 +122,9 @@ async def refresh_hourly_data():
     try:
         pool = await get_db()
         tickers = await _get_tracked_tickers()
+        if not tickers:
+            logger.info("⏭  Hourly refresh skipped — no tracked tickers.")
+            return
         svc = OHLCVService(pool)
         success, failed, count = await svc.ingest_tickers(tickers, "1h", "7d")
         logger.info(f"✅ Hourly refresh: {count} records | failed: {failed}")
@@ -129,6 +138,9 @@ async def refresh_sentiment():
     try:
         pool = await get_db()
         tickers = await _get_tracked_tickers()
+        if not tickers:
+            logger.info("⏭  Sentiment refresh skipped — no tracked tickers.")
+            return
         svc = SentimentService(pool)
         success, failed, total = await svc.ingest_articles(tickers[:20], recent_limit=5)
         logger.info(f"✅ Sentiment refresh: {total} articles | failed: {failed}")
@@ -148,6 +160,9 @@ async def enrich_social_sentiment():
     try:
         pool = await get_db()
         tickers = await _get_tracked_tickers()
+        if not tickers:
+            logger.info("⏭  Social sentiment enrichment skipped — no tracked tickers.")
+            return
         svc = SentimentService(pool)
         # 12 tickers × 2 years = 24 AV calls — stays within free-tier limit
         success, failed = await svc.enrich_social_sentiment(tickers[:12], period_years=2)
@@ -166,14 +181,13 @@ async def regenerate_signals():
     try:
         pool = await get_db()
         tickers = await _get_tracked_tickers()
+        if not tickers:
+            logger.info("⏭  Signal regen skipped — no tracked tickers.")
+            return
         svc = SignalService(pool)
 
-        async def generate_for_interval(interval: str):
-            results = await svc.generate_batch(tickers, interval)
-            logger.info(f"✅ Signals [{interval}]: {len(results)} generated")
-            return results
-
-        await asyncio.gather(generate_for_interval("1d"), generate_for_interval("1h"))
+        results = await svc.generate_batch(tickers, "1d")
+        logger.info(f"✅ Signals [1d]: {len(results)} generated")
     except Exception as e:
         logger.error(f"❌ Signal regen error: {e}")
         raise
@@ -293,6 +307,22 @@ def start_scheduler():
         replace_existing=True,
     )
 
+    # Hourly: reconcile DB ↔ MT5 open positions
+    scheduler.add_job(
+        reconcile_positions,
+        CronTrigger(minute=50),
+        id="reconcile_positions",
+        replace_existing=True,
+    )
+
+    # Every 5 min: health checks + alerts
+    scheduler.add_job(
+        run_health_checks,
+        CronTrigger(minute="*/5"),
+        id="health_check",
+        replace_existing=True,
+    )
+
     scheduler.start()
     logger.info("✅ Scheduler started (daily data | hourly data | sentiment | signals | post-market)")
 
@@ -303,6 +333,9 @@ async def refresh_post_market():
     try:
         pool = await get_db()
         tickers = await _get_tracked_tickers()
+        if not tickers:
+            logger.info("⏭  Post-market refresh skipped — no tracked tickers.")
+            return
         svc = OHLCVService(pool)
         success, failed, count = await svc.ingest_tickers(tickers, "1d", "5d")
         logger.info(f"✅ Post-market refresh: {count} records | failed: {failed}")
@@ -320,6 +353,9 @@ async def regenerate_signals_post_close():
     try:
         pool = await get_db()
         tickers = await _get_tracked_tickers()
+        if not tickers:
+            logger.info("⏭  Post-close signal regen skipped — no tracked tickers.")
+            return
         svc = SignalService(pool)
         results = await svc.generate_batch(tickers, "1d")
         logger.info(f"✅ Post-close signals: {len(results)} generated")
@@ -368,6 +404,32 @@ async def check_price_alert_rules():
                     logger.info(f"🔔 Price rule triggered: {msg}")
     except Exception as e:
         logger.error(f"❌ Price alert rule check error: {e}")
+
+
+async def reconcile_positions():
+    """Hourly: verify DB ↔ MT5 open positions are in sync."""
+    try:
+        pool = await get_db()
+        broker = BrokerService()
+        if not await broker.is_connected():
+            return
+        svc = ReconciliationService(pool, broker)
+        await svc.reconcile()
+    except Exception as e:
+        logger.error(f"❌ Reconciliation error: {e}")
+        raise
+
+
+async def run_health_checks():
+    """Every 5 min: check MT5, DB, model, signal age, equity guardrail."""
+    try:
+        pool = await get_db()
+        broker = BrokerService()
+        monitor = HealthMonitor(pool, broker)
+        await monitor.run_checks()
+    except Exception as e:
+        logger.error(f"❌ Health check error: {e}")
+        # Do NOT raise — health checks themselves must never crash the scheduler
 
 
 async def check_signal_outcomes():

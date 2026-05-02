@@ -36,10 +36,13 @@ class ExecutionService:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    async def execute_signal(self, signal_id: int, user_id: int) -> dict:
+    async def execute_signal(
+        self, signal_id: int, user_id: int, volume_override: Optional[float] = None
+    ) -> dict:
         """
         Manually execute a specific signal for a user.
         Performs all risk checks then places the order.
+        volume_override skips auto position-sizing and uses the supplied lot size.
         """
         config = await self._get_config(user_id)
         if not config:
@@ -51,7 +54,7 @@ class ExecutionService:
         if not signal:
             return {"ok": False, "error": f"Signal {signal_id} not found"}
 
-        return await self._place_for_signal(signal, config, user_id)
+        return await self._place_for_signal(signal, config, user_id, volume_override=volume_override)
 
     async def auto_execute(self, user_id: int) -> list[dict]:
         """
@@ -64,17 +67,19 @@ class ExecutionService:
         if not config or not config["enabled"] or not config["auto_trade"]:
             return []
 
-        # Signals from the last 30 minutes that haven't been executed yet
+        # Signals from the last 24 hours that haven't been successfully filled
         async with self.pool.acquire() as conn:
             signals = await conn.fetch(
                 """
                 SELECT s.* FROM signals s
                 WHERE s.action IN ('BUY', 'SELL')
                   AND s.confidence >= $1
-                  AND s.created_at >= NOW() - INTERVAL '30 minutes'
+                  AND s.created_at >= NOW() - INTERVAL '24 hours'
                   AND NOT EXISTS (
                       SELECT 1 FROM trade_executions te
-                      WHERE te.signal_id = s.id AND te.user_id = $2
+                      WHERE te.signal_id = s.id
+                        AND te.user_id = $2
+                        AND te.status IN ('filled', 'pending')
                   )
                 ORDER BY s.confidence DESC
                 """,
@@ -186,7 +191,9 @@ class ExecutionService:
 
     # ── Read helpers ──────────────────────────────────────────────────────────
 
-    async def get_executions(self, user_id: int, limit: int = 50) -> list[dict]:
+    async def get_executions(
+        self, user_id: int, limit: int = 20, offset: int = 0
+    ) -> dict:
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 """
@@ -195,11 +202,15 @@ class ExecutionService:
                 LEFT JOIN signals s ON s.id = te.signal_id
                 WHERE te.user_id = $1
                 ORDER BY te.created_at DESC
-                LIMIT $2
+                LIMIT $2 OFFSET $3
                 """,
-                user_id, limit,
+                user_id, limit, offset,
             )
-        return [dict(r) for r in rows]
+            total = await conn.fetchval(
+                "SELECT COUNT(*) FROM trade_executions WHERE user_id = $1",
+                user_id,
+            )
+        return {"items": [dict(r) for r in rows], "total": total}
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
@@ -218,7 +229,8 @@ class ExecutionService:
         return dict(row) if row else None
 
     async def _place_for_signal(
-        self, signal: dict, config: dict, user_id: int
+        self, signal: dict, config: dict, user_id: int,
+        volume_override: Optional[float] = None,
     ) -> dict:
         """
         Run all pre-trade checks and place the order if everything passes.
@@ -270,20 +282,30 @@ class ExecutionService:
             return {"ok": False, "signal_id": signal_id,
                     "error": f"Symbol '{symbol}' not found in MT5 — check symbol_suffix"}
 
-        # ── Position sizing: fixed-fraction risk ──────────────────────────────
-        volume = self._calculate_volume(
-            balance=balance,
-            risk_pct=config["risk_per_trade_pct"],
-            entry=entry,
-            stop_loss=sl,
-            contract_size=sym_info["contract_size"],
-            volume_min=sym_info["volume_min"],
-            volume_max=sym_info["volume_max"],
-            volume_step=sym_info["volume_step"],
-        )
+        # Use the broker's actual symbol name (may differ from ticker, e.g. Apple vs AAPL)
+        symbol = sym_info["symbol"]
+
+        # ── Position sizing ────────────────────────────────────────────────────
+        if volume_override is not None:
+            # Clamp manual lot size to broker limits
+            step = sym_info["volume_step"]
+            steps = int(volume_override / step)
+            volume = round(steps * step, 8)
+            volume = max(sym_info["volume_min"], min(volume, sym_info["volume_max"]))
+        else:
+            volume = self._calculate_volume(
+                balance=balance,
+                risk_pct=config["risk_per_trade_pct"],
+                entry=entry,
+                stop_loss=sl,
+                contract_size=sym_info["contract_size"],
+                volume_min=sym_info["volume_min"],
+                volume_max=sym_info["volume_max"],
+                volume_step=sym_info["volume_step"],
+            )
         if volume <= 0:
             return {"ok": False, "signal_id": signal_id,
-                    "error": "Calculated volume is 0 — stop distance may be too small"}
+                    "error": "Volume is 0 — stop distance too small or requested size below broker minimum"}
 
         # ── Use current market price for SL/TP if signal prices are stale ────
         current = await self.broker.current_price(symbol, action)
@@ -376,25 +398,37 @@ class ExecutionService:
         volume_min: float,
         volume_max: float,
         volume_step: float,
+        max_position_pct: float = 10.0,
     ) -> float:
         """
-        Fixed-fraction position sizing.
+        Fixed-fraction position sizing with affordability cap.
 
-          risk_amount = balance × risk_pct / 100
+          risk_amount   = balance × risk_pct / 100
           stop_distance = |entry - stop_loss|
-          volume (lots) = risk_amount / (stop_distance × contract_size)
+          risk_volume   = risk_amount / (stop_distance × contract_size)
 
-        Then clamp and round to the broker's lot step.
+          affordability cap: position cost ≤ balance × max_position_pct / 100
+          affordable_volume = (balance × max_position_pct / 100) / (entry × contract_size)
+
+          volume = min(risk_volume, affordable_volume)
+
+        Prevents tiny stop distances from producing absurdly large lot sizes.
         """
         stop_distance = abs(entry - stop_loss)
-        if stop_distance == 0 or contract_size == 0:
+        if stop_distance == 0 or contract_size == 0 or entry == 0:
             return 0.0
 
-        risk_amount = balance * risk_pct / 100.0
-        raw_volume = risk_amount / (stop_distance * contract_size)
+        risk_amount  = balance * risk_pct / 100.0
+        risk_volume  = risk_amount / (stop_distance * contract_size)
+
+        # Cap: total position cost must not exceed max_position_pct% of balance
+        max_cost             = balance * max_position_pct / 100.0
+        affordable_volume    = max_cost / (entry * contract_size)
+
+        raw_volume = min(risk_volume, affordable_volume)
 
         # Round down to nearest volume_step
-        steps = int(raw_volume / volume_step)
+        steps  = int(raw_volume / volume_step)
         volume = round(steps * volume_step, 8)
 
         return max(volume_min, min(volume, volume_max)) if volume >= volume_min else 0.0

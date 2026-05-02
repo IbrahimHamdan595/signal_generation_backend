@@ -31,7 +31,7 @@ class OHLCVService:
         interval: str = "1d",
         period: str = "1y",
         concurrency: int = 5,
-    ) -> Tuple[List[str], List[str], int]:
+    ) -> Tuple[List[str], List[str], int, List[dict]]:
         """
         Ingest multiple tickers concurrently using a semaphore to stay within
         Yahoo Finance's rate limit (~2 req/s).
@@ -39,9 +39,14 @@ class OHLCVService:
         concurrency=5 with a 0.5s stagger between slot acquisitions keeps the
         effective request rate at ~2/s while finishing 5x faster than serial.
         For 500 tickers: ~8 min instead of ~40 min.
+
+        Returns (success, failed, total, failed_details) where failed_details
+        is a list of {"ticker": ..., "error": ...} so callers can surface the
+        underlying failure reason instead of a bare ticker symbol.
         """
         success: List[str] = []
         failed:  List[str] = []
+        failed_details: List[dict] = []
         total = 0
         sem = asyncio.Semaphore(concurrency)
         lock = asyncio.Lock()   # protects the shared result lists
@@ -60,28 +65,36 @@ class OHLCVService:
                 except Exception as e:
                     async with lock:
                         failed.append(ticker.upper())
+                        failed_details.append({"ticker": ticker.upper(), "error": str(e)})
                     logger.error(f"❌ {ticker}: {e}")
 
         await asyncio.gather(*[_fetch_one(t) for t in tickers])
-        return success, failed, total
+        return success, failed, total, failed_details
 
-    async def _ingest_single(self, ticker: str, interval: str, period: str) -> int:
+    async def _ingest_single(
+        self, ticker: str, interval: str, period: str, start_date: date = None
+    ) -> int:
+        """
+        start_date: if provided, fetch only bars on/after this date (incremental).
+        Returns 0 (not an error) when start_date is given and yfinance has nothing new.
+        """
         loop = asyncio.get_event_loop()
         max_retries = 3
         df = None
 
+        _t = ticker
+        _i = interval
+        _p = period
+        _sd = start_date
+
         for attempt in range(max_retries):
             try:
-                # yf.download() is more stable than Ticker.history() in yfinance 0.2.x+
-                # threads=False prevents nested thread spawning inside the executor
-                _t = ticker  # capture for lambda closure
-                _i = interval
-                _p = period
                 df = await loop.run_in_executor(
                     None,
                     lambda: yf.download(
                         _t,
-                        period=_p,
+                        # incremental: use start/end; full: use period
+                        **({"start": _sd, "end": date.today()} if _sd else {"period": _p}),
                         interval=_i,
                         progress=False,
                         auto_adjust=True,
@@ -94,8 +107,10 @@ class OHLCVService:
                     logger.info(f"✅ Successfully fetched {ticker} (attempt {attempt + 1})")
                     break
                 else:
-                    # Empty result is usually Yahoo Finance rate-limiting or a transient
-                    # parse error inside yfinance — always retry with a longer wait
+                    if _sd:
+                        # Empty is normal for incremental — no new bars since last ingest
+                        logger.info(f"⏭️  {ticker}: no new bars since {_sd} — skipping")
+                        return 0
                     wait_time = 10 * (attempt + 1)
                     logger.warning(
                         f"⚠️ Empty response for {ticker}, attempt {attempt + 1}/{max_retries} "
@@ -112,12 +127,31 @@ class OHLCVService:
                     await asyncio.sleep(wait_time)
 
         if df is None or df.empty:
+            if start_date:
+                return 0  # incremental with no new data is not an error
             raise ValueError(
                 f"No data returned for {ticker} after {max_retries} attempts"
             )
 
         df = df.reset_index()
-        df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+
+        # Flatten MultiIndex columns produced by newer yfinance versions.
+        # If two tuples share the same first element (e.g. ('Close','') and
+        # ('Close','ORCL')), keep only the first occurrence to avoid duplicate
+        # column names that would make df["close"] return a 2-column DataFrame.
+        if isinstance(df.columns, pd.MultiIndex):
+            seen = {}
+            new_cols = []
+            for col in df.columns:
+                key = col[0] if isinstance(col, tuple) else col
+                if key not in seen:
+                    seen[key] = True
+                    new_cols.append(key)
+                else:
+                    new_cols.append(f"_dup_{key}")
+            df.columns = new_cols
+        else:
+            df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
 
         col_map = {
             "Datetime": "timestamp",
@@ -127,8 +161,12 @@ class OHLCVService:
             "Low": "low",
             "Close": "close",
             "Volume": "volume",
+            "Price": "timestamp",  # some yfinance versions use 'Price' as index name
         }
         df.rename(columns=col_map, inplace=True)
+
+        # Drop any duplicate/garbage columns
+        df = df.loc[:, ~df.columns.str.startswith("_dup_")]
 
         available = [
             c
@@ -146,11 +184,34 @@ class OHLCVService:
             df["timestamp"] = df["timestamp"].dt.tz_localize(None)
 
         # ── Fetch real external data (all blocking — run in thread pool) ────────
-        vix_series, earnings_dates, putcall_series = await asyncio.gather(
+        # return_exceptions=True so a single auxiliary fetch failure doesn't
+        # abort the whole ticker. The earlier behaviour caused AAPL/ADSK/MA
+        # to fail wholesale when yfinance returned a transient error on VIX or
+        # earnings.
+        vix_raw, earnings_raw, putcall_raw = await asyncio.gather(
             loop.run_in_executor(None, lambda: self._fetch_vix_series(period)),
             loop.run_in_executor(None, lambda: self._fetch_earnings_dates(ticker)),
             loop.run_in_executor(None, lambda: self._fetch_putcall_series()),
+            return_exceptions=True,
         )
+
+        if isinstance(vix_raw, Exception):
+            logger.warning(f"⚠️  VIX fetch failed for {ticker}: {vix_raw}")
+            vix_series = pd.Series(dtype=float)
+        else:
+            vix_series = vix_raw
+
+        if isinstance(earnings_raw, Exception):
+            logger.warning(f"⚠️  Earnings fetch failed for {ticker}: {earnings_raw}")
+            earnings_dates = pd.DatetimeIndex([])
+        else:
+            earnings_dates = earnings_raw
+
+        if isinstance(putcall_raw, Exception):
+            logger.warning(f"⚠️  Put/call fetch failed for {ticker}: {putcall_raw}")
+            putcall_series = pd.Series(dtype=float)
+        else:
+            putcall_series = putcall_raw
 
         indicators_df = await loop.run_in_executor(
             None,

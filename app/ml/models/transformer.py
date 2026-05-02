@@ -69,5 +69,7 @@ class TransformerEncoder(nn.Module):
         x = self.pos_encoding(x)
         x = self.transformer(x)               # → (batch, seq_len, d_model)
         x = self.norm(x)
-        # Pool: use the last timestep as the sequence representation
-        return x[:, -1, :]                    # → (batch, d_model)
+        # Mean pooling: average all timesteps so any bar in the window can contribute.
+        # Last-token pooling biased toward recent bars; mean is more robust for
+        # financial series where the signal can appear anywhere in the lookback window.
+        return x.mean(dim=1)                  # → (batch, d_model)
