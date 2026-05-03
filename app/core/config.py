@@ -10,6 +10,10 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
 
+    # Supabase — project URL + service-role key for Storage access
+    SUPABASE_URL: str = ""
+    SUPABASE_SERVICE_KEY: str = ""
+
     NEWSAPI_KEY: str = ""
     HF_API_TOKEN: str = ""
     HF_FINBERT_URL: str = (

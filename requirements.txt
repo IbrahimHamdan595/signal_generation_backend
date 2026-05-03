@@ -38,9 +38,11 @@ tqdm>=4.66.0
 apscheduler>=3.10.0
 
 # ── Phase 5: Broker Integration ───────────────────────────
-# Windows-only — requires MT5 terminal installed and running.
-# Comment out on Linux/macOS CI environments.
-MetaTrader5>=5.0.45
+# Windows-only — comment out when deploying to Linux (Render/Railway).
+# MetaTrader5>=5.0.45
+
+# ── Supabase Storage (checkpoint persistence) ─────────────
+supabase>=2.0.0
 
 # ── Rate Limiting ─────────────────────────────────────────
 slowapi>=0.1.9

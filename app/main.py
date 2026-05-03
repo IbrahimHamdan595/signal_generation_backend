@@ -26,6 +26,8 @@ limiter = Limiter(key_func=get_remote_address)
 async def lifespan(app: FastAPI):
     logger.info(f"Starting {settings.APP_NAME} v{settings.APP_VERSION}")
     await connect_db()
+    from app.services.storage_service import sync_from_cloud
+    sync_from_cloud()
     load_model()
     start_scheduler()
     yield

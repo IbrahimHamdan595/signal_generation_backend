@@ -130,6 +130,9 @@ class MLService:
         save_model_config(model_config)
         save_scaler_params(scaler_params)  # now a dict: ticker → {mean, std}
 
+        from app.services.storage_service import upload
+        upload("eval_report.json", "checkpoints/eval_report.json")
+
         # ── Walk-forward summary (3 folds, same data) ─────────────────────────
         # Runs after the final model is trained to give N accuracy estimates
         # across different market regimes rather than a single 70/15/15 split.

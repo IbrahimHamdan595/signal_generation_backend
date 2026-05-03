@@ -95,6 +95,9 @@ def register_version(
     if os.path.exists(versioned_path):
         shutil.copy2(versioned_path, MODEL_PATH)
         logger.info(f"🏆 New best model → {checkpoint_name} (val_loss={val_loss:.4f})")
+        from app.services.storage_service import upload
+        upload("best_model.pt", MODEL_PATH)
+        upload("versions.json", VERSION_INDEX)
 
     return entry
 
@@ -140,6 +143,8 @@ def save_model_config(config: dict):
     with open(MODEL_CFG_PATH, "w") as f:
         json.dump(config_out, f, indent=2)
     logger.info(f"💾 Model config saved → {MODEL_CFG_PATH}")
+    from app.services.storage_service import upload
+    upload("model_config.json", MODEL_CFG_PATH)
 
 
 def save_scaler_params(params: dict):
@@ -147,12 +152,23 @@ def save_scaler_params(params: dict):
     with open(SCALER_PATH, "w") as f:
         json.dump(params, f, indent=2)
     logger.info(f"💾 Scaler params saved → {SCALER_PATH}")
+    from app.services.storage_service import upload
+    upload("scaler_params.json", SCALER_PATH)
 
 
 # ── Model loading ─────────────────────────────────────────────────────────────
 
 def load_model() -> Optional[TradingFusionModel]:
     global _model_instance
+    # Pull from Supabase Storage if files are missing (e.g. fresh Render deploy)
+    from app.services.storage_service import download
+    if not os.path.exists(MODEL_PATH):
+        download("best_model.pt", MODEL_PATH)
+    if not os.path.exists(MODEL_CFG_PATH):
+        download("model_config.json", MODEL_CFG_PATH)
+    if not os.path.exists(SCALER_PATH):
+        download("scaler_params.json", SCALER_PATH)
+
     if not os.path.exists(MODEL_PATH) or not os.path.exists(MODEL_CFG_PATH):
         logger.warning("⚠️  No trained model found.")
         return None
