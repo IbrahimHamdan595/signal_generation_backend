@@ -27,6 +27,8 @@ class Settings(BaseSettings):
     # Finnhub — free tier: 60 req/min, company news with historical date ranges
     FINNHUB_API_KEY: str = ""
 
+    CORS_ALLOWED_ORIGINS: str = "http://localhost:3000,http://localhost:8501"
+
     APP_NAME: str = "Trading Signal API"
     APP_VERSION: str = "2.0.0"
     APP_DEBUG: bool = False
