@@ -178,8 +178,13 @@ def load_model() -> Optional[TradingFusionModel]:
 
     arch_version = config.get("model_version", "v1")
 
+    # Strip inference-only keys that are stored alongside arch params but must
+    # not be forwarded to the constructor (temperature, thresholds, etc.)
+    _INFERENCE_KEYS = {"temperature", "confidence_threshold", "margin_threshold"}
+    arch_config = {k: v for k, v in config.items() if k not in _INFERENCE_KEYS}
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model  = TradingFusionModel(**config)
+    model  = TradingFusionModel(**arch_config)
     ckpt   = torch.load(MODEL_PATH, map_location=device, weights_only=True)
     try:
         model.load_state_dict(ckpt["model_state"])

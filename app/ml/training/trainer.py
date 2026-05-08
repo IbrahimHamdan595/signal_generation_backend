@@ -8,6 +8,51 @@ import logging
 
 from app.ml.models.fusion_model import TradingFusionModel
 
+
+class FocalLoss(nn.Module):
+    """Multi-class focal loss with optional class weights and label smoothing.
+
+    FL(p_t) = -α_t · (1 − p_t)^γ · log(p_t)
+
+    γ=2.0 down-weights easy examples (high-confidence correct predictions) so
+    training focuses on the hard, uncertain samples — exactly what we want when
+    BUY/SELL signals are rare and HOLD dominates the batch.
+    """
+
+    def __init__(
+        self,
+        gamma: float = 2.0,
+        weight: Optional[torch.Tensor] = None,
+        label_smoothing: float = 0.1,
+    ):
+        super().__init__()
+        self.gamma           = gamma
+        self.weight          = weight
+        self.label_smoothing = label_smoothing
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        n_cls = logits.size(-1)
+
+        # Smooth one-hot targets
+        with torch.no_grad():
+            fill = self.label_smoothing / max(n_cls - 1, 1)
+            smooth = torch.full_like(logits, fill)
+            smooth.scatter_(1, targets.unsqueeze(1), 1.0 - self.label_smoothing)
+
+        log_probs = torch.log_softmax(logits, dim=-1)
+        probs     = torch.exp(log_probs)
+
+        # Probability of the true class — used for focal modulation only
+        p_t = probs.gather(1, targets.unsqueeze(1)).squeeze(1).detach()
+
+        ce    = -(smooth * log_probs).sum(dim=-1)          # per-sample CE
+        focal = (1.0 - p_t) ** self.gamma * ce            # focal weighting
+
+        if self.weight is not None:
+            focal = focal * self.weight[targets]
+
+        return focal.mean()
+
 logger = logging.getLogger(__name__)
 
 CHECKPOINT_DIR = "checkpoints"
@@ -55,19 +100,18 @@ class Trainer:
         self._warmup_epochs = 5
         self.scheduler = None  # built lazily in fit()
 
+        self.cls_loss_fn = FocalLoss(
+            gamma=2.0,
+            weight=class_weights.to(self.device) if class_weights is not None else None,
+            label_smoothing=0.1,
+        )
         if class_weights is not None:
-            self.cls_loss_fn = nn.CrossEntropyLoss(
-                weight=class_weights.to(self.device),
-                label_smoothing=0.05,
-            )
-            logger.info(f"⚖️  Class weights: {class_weights.tolist()}")
-        else:
-            self.cls_loss_fn = nn.CrossEntropyLoss(label_smoothing=0.05)
+            logger.info(f"⚖️  Class weights applied to FocalLoss: {class_weights.tolist()}")
 
         self.reg_loss_fn    = nn.MSELoss()
         self.timing_loss_fn = nn.CrossEntropyLoss(
             weight=timing_class_weights.to(self.device) if timing_class_weights is not None else None,
-            label_smoothing=0.05,
+            label_smoothing=0.1,
         )
 
         self.cls_weight    = cls_weight

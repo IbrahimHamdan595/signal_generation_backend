@@ -27,6 +27,10 @@ class Settings(BaseSettings):
     # Finnhub — free tier: 60 req/min, company news with historical date ranges
     FINNHUB_API_KEY: str = ""
 
+    # FRED (St. Louis Fed) — free API key at fred.stlouisfed.org/docs/api/api_key.html
+    # Used for CPI and NFP release date calendars. Falls back to algorithmic if unset.
+    FRED_API_KEY: str = ""
+
     CORS_ALLOWED_ORIGINS: str = "http://localhost:3000,http://localhost:8501"
 
     APP_NAME: str = "Trading Signal API"

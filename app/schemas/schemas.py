@@ -104,6 +104,10 @@ class IndicatorsResponse(BaseModel):
     earnings_days: Optional[int] = None
     social_sentiment: Optional[float] = None
     options_put_call_ratio: Optional[float] = None
+    fomc_days: Optional[float] = None
+    cpi_days: Optional[float] = None
+    nfp_days: Optional[float] = None
+    eps_surprise_pct: Optional[float] = None
 
 
 # ── Ingestion ─────────────────────────────────────────────────────────────────

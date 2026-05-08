@@ -84,16 +84,17 @@ class MLService:
         test_loader  = DataLoader(test_ds,  batch_size=batch_size, shuffle=False, drop_last=False)
 
         model_config = {
-            "n_features": len(FEATURE_COLS),
-            "seq_len":    seq_len,
-            "d_model":    128,
-            "n_heads":    8,
-            "n_layers":   2,
-            "d_ff":       256,
-            "sent_input": 4,
-            "sent_dim":   32,
-            "mlp_hidden": 128,
-            "dropout":    0.30,
+            "n_features":         len(FEATURE_COLS),
+            "seq_len":            seq_len,
+            "d_model":            128,
+            "n_heads":            8,
+            "n_layers":           3,       # was 2 — deeper encoder captures longer-range macro patterns
+            "d_ff":               256,
+            "sent_input":         4,
+            "sent_dim":           32,
+            "mlp_hidden":         128,
+            "dropout":            0.30,
+            "use_cross_attention": True,   # sentiment cross-attends into price sequence
         }
         model = TradingFusionModel(**model_config)
         total_params = sum(p.numel() for p in model.parameters())
@@ -122,6 +123,22 @@ class MLService:
         )
         train_results = trainer.fit(train_loader, val_loader, epochs=epochs)
         trainer.load_best()
+
+        # ── Temperature calibration ───────────────────────────────────────────
+        from app.ml.evaluation.calibration import TemperatureScaler
+        cal = TemperatureScaler()
+        temperature = cal.fit(model, val_loader)
+        model_config["temperature"] = round(temperature, 6)
+        logger.info(f"🌡️  Calibrated temperature T={temperature:.4f} saved to model config")
+
+        # ── Threshold auto-tuning ─────────────────────────────────────────────
+        tuned = self._tune_thresholds(model, val_loader, temperature)
+        model_config["confidence_threshold"] = tuned["confidence_threshold"]
+        model_config["margin_threshold"]     = tuned["margin_threshold"]
+        logger.info(
+            f"🎯 Tuned thresholds: conf={tuned['confidence_threshold']} "
+            f"margin={tuned['margin_threshold']}"
+        )
 
         evaluator    = ModelEvaluator(model, interval=interval)
         eval_results = evaluator.evaluate(test_loader)
@@ -242,7 +259,9 @@ class MLService:
             fold_loader_va = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, drop_last=False)
 
             fold_cw = compute_class_weights(y_cls_all[:train_end], n_classes=3)
-            fold_model = TradingFusionModel(**model_config)
+            _INFERENCE_KEYS = {"temperature", "confidence_threshold", "margin_threshold"}
+            arch_cfg = {k: v for k, v in model_config.items() if k not in _INFERENCE_KEYS}
+            fold_model = TradingFusionModel(**arch_cfg)
             fold_trainer = Trainer(
                 fold_model, lr=lr, class_weights=fold_cw,
                 checkpoint_name=f"_wf_fold{fold+1}_tmp.pt",
@@ -457,6 +476,74 @@ class MLService:
             "n_samples": N,
         }
 
+    # ── Threshold auto-tuning ─────────────────────────────────────────────────
+
+    def _tune_thresholds(
+        self,
+        model,
+        val_loader,
+        temperature: float = 1.0,
+    ) -> dict:
+        """Sweep confidence and margin thresholds on the validation set.
+
+        Objective: maximise F1 on BUY+SELL predictions subject to recall ≥ 5%.
+        Returns the (conf_threshold, margin_threshold) pair with the best F1.
+        Defaults (0.58 / 0.15) are returned when the sweep finds nothing better.
+        """
+        device = next(model.parameters()).device
+        model.eval()
+
+        all_probs  = []
+        all_labels = []
+
+        with torch.no_grad():
+            for batch in val_loader:
+                x_price, x_sent, y_cls = batch[0], batch[1], batch[2]
+                dl, _, _ = model(x_price.to(device), x_sent.to(device))
+                probs = torch.softmax(dl / max(temperature, 0.1), dim=-1).cpu().numpy()
+                all_probs.append(probs)
+                all_labels.append(y_cls.numpy())
+
+        probs  = np.concatenate(all_probs)   # (N, 3)
+        labels = np.concatenate(all_labels)  # (N,)
+
+        best_f1  = -1.0
+        best     = {"confidence_threshold": 0.58, "margin_threshold": 0.15}
+
+        max_probs  = probs.max(axis=1)
+        pred_cls   = probs.argmax(axis=1)
+        sorted_p   = np.sort(probs, axis=1)[:, ::-1]
+        margins    = sorted_p[:, 0] - sorted_p[:, 1]
+        is_signal  = (labels == 1) | (labels == 2)     # true BUY or SELL
+        total_true = max(is_signal.sum(), 1)
+
+        for conf_t in np.arange(0.45, 0.80, 0.025):
+            for margin_t in np.arange(0.05, 0.35, 0.025):
+                passes  = (max_probs >= conf_t) & (margins >= margin_t) & (pred_cls != 0)
+                n_pred  = passes.sum()
+                if n_pred < 5:
+                    continue
+
+                tp        = ((pred_cls == labels) & passes).sum()
+                precision = tp / n_pred
+                recall    = tp / total_true
+                if recall < 0.05:
+                    continue
+
+                f1 = 2 * precision * recall / max(precision + recall, 1e-9)
+                if f1 > best_f1:
+                    best_f1 = f1
+                    best = {
+                        "confidence_threshold": round(float(conf_t), 3),
+                        "margin_threshold":     round(float(margin_t), 3),
+                    }
+
+        logger.info(
+            f"🎯 Threshold sweep: conf={best['confidence_threshold']} "
+            f"margin={best['margin_threshold']} F1={best_f1:.4f}"
+        )
+        return best
+
     # ── Data quality pre-check ────────────────────────────────────────────────
 
     async def _quality_filter(self, tickers: List[str], interval: str) -> List[str]:
@@ -517,9 +604,18 @@ class MLService:
     # ── Single-ticker inference ───────────────────────────────────────────────
 
     async def predict_ticker(self, ticker: str, interval: str = "1d") -> dict:
-        from app.ml.models.registry import get_model, load_scaler_params
+        import json as _json
+        from app.ml.models.registry import get_model, load_scaler_params, MODEL_CFG_PATH
         from app.services.cache_service import get_cache
         from app.core.config import settings
+
+        _mcfg: dict = {}
+        try:
+            if os.path.exists(MODEL_CFG_PATH):
+                with open(MODEL_CFG_PATH) as _f:
+                    _mcfg = _json.load(_f)
+        except Exception:
+            pass
 
         # Cache TTL scales inversely with bar duration: a 1d prediction stays
         # valid much longer than a 5m one because a new bar arrives less often.
@@ -590,8 +686,18 @@ class MLService:
         x_price = torch.tensor(X_price[-1:], dtype=torch.float32).to(device)
         x_sent  = torch.tensor(X_sent[-1:],  dtype=torch.float32).to(device)
 
+        temperature           = float(_mcfg.get("temperature",           1.0))
+        _CONFIDENCE_THRESHOLD = float(_mcfg.get("confidence_threshold", 0.58))
+        _MARGIN_THRESHOLD     = float(_mcfg.get("margin_threshold",     0.15))
+
         current_ts = datetime.now(timezone.utc)
-        result     = model.predict(x_price, x_sent, current_ts=current_ts, interval=interval)
+        result     = model.mc_predict(
+            x_price, x_sent,
+            n_samples=20,
+            temperature=temperature,
+            current_ts=current_ts,
+            interval=interval,
+        )
 
         action     = result["action"][0]
         confidence = result["confidence"][0]
@@ -602,10 +708,8 @@ class MLService:
         prob_margin  = probs_sorted[0] - probs_sorted[1]
 
         # Filter 1: confidence + margin — both must pass.
-        # A signal with BUY=0.55, SELL=0.30 is not actionable; the dominant
-        # class must lead the second by ≥0.15 to indicate real separation.
-        _CONFIDENCE_THRESHOLD = 0.58
-        _MARGIN_THRESHOLD     = 0.15
+        # Thresholds are auto-tuned on the val set after training; defaults
+        # apply when no trained model config is present.
         if action != "HOLD" and (confidence < _CONFIDENCE_THRESHOLD or prob_margin < _MARGIN_THRESHOLD):
             logger.info(
                 f"🔇 {ticker}: {action} filtered — conf={confidence:.3f} margin={prob_margin:.3f} → HOLD"
@@ -657,8 +761,9 @@ class MLService:
         output = {
             "ticker":    ticker.upper(),
             "interval":  interval,
-            "action":    action,
-            "confidence": round(confidence, 4),
+            "action":      action,
+            "confidence":  round(confidence, 4),
+            "uncertainty": round(float(result.get("uncertainty", [0])[0]), 4),
             "probabilities": {
                 "hold": round(result["probabilities"]["hold"][0], 4),
                 "buy":  round(result["probabilities"]["buy"][0],  4),

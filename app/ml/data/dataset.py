@@ -59,6 +59,12 @@ INDICATOR_COLS = [
     "earnings_days",
     "social_sentiment",
     "options_put_call_ratio",
+    # Macro event countdowns (days to next FOMC / CPI / NFP release)
+    "fomc_days",
+    "cpi_days",
+    "nfp_days",
+    # EPS surprise % from most recent earnings (forward-filled 30 days)
+    "eps_surprise_pct",
 ]
 
 SENTIMENT_COLS = ["avg_positive", "avg_negative", "avg_neutral", "avg_compound"]

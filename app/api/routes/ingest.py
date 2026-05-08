@@ -1,9 +1,10 @@
-from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks
+from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks, Query
 from typing import List
 
 from app.core.security import get_current_active_user
 from app.db.database import get_db
 from app.services.ohlcv_service import OHLCVService, VALID_INTERVALS, VALID_PERIODS
+from app.services.macro_event_service import MacroEventService
 from app.services.job_service import JobService
 from app.schemas.schemas import IngestRequest, IngestResponse, MessageResponse
 
@@ -107,6 +108,34 @@ async def available_tickers(
     current_user=Depends(get_current_active_user),
 ):
     return await OHLCVService(pool).get_available_tickers()
+
+
+@router.post("/macro-events", response_model=dict)
+async def ingest_macro_events(
+    start_year: int = Query(default=2015, ge=2000, le=2030),
+    end_year:   int = Query(default=2027, ge=2000, le=2035),
+    pool=Depends(get_db),
+    current_user=Depends(get_current_active_user),
+):
+    """Fetch FOMC/CPI/NFP event dates and store in macro_events table.
+
+    Sources: Fed website (FOMC), FRED API (CPI/NFP), algorithmic fallback (NFP).
+    Safe to re-run — duplicates are ignored. Run once after migrations.
+    Set FRED_API_KEY in .env for accurate CPI dates (free at fred.stlouisfed.org).
+    """
+    svc = MacroEventService(pool)
+    result = await svc.ingest_macro_events(start_year=start_year, end_year=end_year)
+    return {"message": "Macro events ingested", **result}
+
+
+@router.get("/macro-events", response_model=dict)
+async def get_macro_events(
+    pool=Depends(get_db),
+    current_user=Depends(get_current_active_user),
+):
+    """Return all stored FOMC/CPI/NFP event dates grouped by type."""
+    svc = MacroEventService(pool)
+    return await svc.get_all_dates()
 
 
 @router.get("/sp500", response_model=dict)

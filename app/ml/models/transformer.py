@@ -70,6 +70,14 @@ class TransformerEncoder(nn.Module):
         x = self.transformer(x)               # → (batch, seq_len, d_model)
         x = self.norm(x)
         # Mean pooling: average all timesteps so any bar in the window can contribute.
-        # Last-token pooling biased toward recent bars; mean is more robust for
-        # financial series where the signal can appear anywhere in the lookback window.
         return x.mean(dim=1)                  # → (batch, d_model)
+
+    def forward_seq(self, x: torch.Tensor) -> torch.Tensor:
+        """Same as forward() but returns the full normalised sequence before mean pooling.
+        Used by SentimentCrossAttention to attend over individual bars.
+        Returns (batch, seq_len, d_model).
+        """
+        x = self.input_projection(x)
+        x = self.pos_encoding(x)
+        x = self.transformer(x)
+        return self.norm(x)                   # → (batch, seq_len, d_model)

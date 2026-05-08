@@ -6,14 +6,19 @@ import numpy as np
 import asyncpg
 import httpx
 from datetime import datetime, date, timezone
-from typing import List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional
 import logging
+
+from app.core.config import settings
+from app.services.macro_event_service import days_to_next_event
 
 # ── Module-level caches (shared across all OHLCVService instances) ────────────
 # VIX: keyed by period string → (Series, fetched_date)
 _VIX_CACHE: dict[str, tuple[pd.Series, date]] = {}
 # CBOE equity put/call: single cache entry → (Series, fetched_date)
 _PUTCALL_CACHE: Optional[tuple[pd.Series, date]] = None
+# Macro events: {event_type: [iso_date_str, ...]} cached per day
+_MACRO_EVENTS_CACHE: Optional[tuple[dict, date]] = None
 
 logger = logging.getLogger(__name__)
 
@@ -213,9 +218,17 @@ class OHLCVService:
         else:
             putcall_series = putcall_raw
 
+        # EPS surprises (async Finnhub call) and macro event dates (cached DB load)
+        eps_history, macro_events = await asyncio.gather(
+            self._fetch_and_store_eps_surprises(ticker),
+            self._load_macro_events(),
+        )
+
         indicators_df = await loop.run_in_executor(
             None,
-            lambda: self._compute_indicators(df, vix_series, earnings_dates, putcall_series),
+            lambda: self._compute_indicators(
+                df, vix_series, earnings_dates, putcall_series, macro_events, eps_history
+            ),
         )
 
         def safe(val):
@@ -271,7 +284,10 @@ class OHLCVService:
                 row.get("volume_above_avg"), safe(row.get("vix_level")),
                 safe(row.get("vix_change")), row.get("earnings_days"),
                 safe(row.get("social_sentiment")),
-                safe(row.get("options_put_call_ratio")), ingested_at,
+                safe(row.get("options_put_call_ratio")),
+                safe(row.get("fomc_days")), safe(row.get("cpi_days")),
+                safe(row.get("nfp_days")), safe(row.get("eps_surprise_pct")),
+                ingested_at,
             )
             for _, row in indicators_df.iterrows()
         ]
@@ -301,13 +317,14 @@ class OHLCVService:
                     price_sma50_dist, high_vol_regime, above_sma50, above_sma200,
                     normalized_volatility, bb_position, roc_5, roc_10, higher_high,
                     lower_low, price_change_pct, volume_above_avg, vix_level, vix_change,
-                    earnings_days, social_sentiment, options_put_call_ratio, computed_at
+                    earnings_days, social_sentiment, options_put_call_ratio,
+                    fomc_days, cpi_days, nfp_days, eps_surprise_pct, computed_at
                 ) VALUES (
                     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
                     $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25,
                     $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37,
                     $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49,
-                    $50, $51, $52
+                    $50, $51, $52, $53, $54, $55, $56
                 )
                 ON CONFLICT (ticker, interval, timestamp) DO UPDATE SET
                     sma_20 = EXCLUDED.sma_20, sma_50 = EXCLUDED.sma_50, ema_12 = EXCLUDED.ema_12,
@@ -333,6 +350,8 @@ class OHLCVService:
                     vix_change = EXCLUDED.vix_change, earnings_days = EXCLUDED.earnings_days,
                     social_sentiment = EXCLUDED.social_sentiment,
                     options_put_call_ratio = EXCLUDED.options_put_call_ratio,
+                    fomc_days = EXCLUDED.fomc_days, cpi_days = EXCLUDED.cpi_days,
+                    nfp_days = EXCLUDED.nfp_days, eps_surprise_pct = EXCLUDED.eps_surprise_pct,
                     computed_at = EXCLUDED.computed_at
                 """,
                 indicator_records,
@@ -419,6 +438,101 @@ class OHLCVService:
             logger.warning(f"⚠️  CBOE put/call unavailable (will use stub 1.0): {e}")
             return empty
 
+    async def _load_macro_events(self) -> Dict[str, List[str]]:
+        """Load macro event dates from DB, cached per calendar day.
+        Returns {event_type: [iso_date_str, ...]} — empty lists when table not populated.
+        """
+        global _MACRO_EVENTS_CACHE
+        today = date.today()
+        if _MACRO_EVENTS_CACHE and _MACRO_EVENTS_CACHE[1] == today:
+            return _MACRO_EVENTS_CACHE[0]
+
+        result: Dict[str, List[str]] = {"fomc": [], "cpi": [], "nfp": []}
+        try:
+            async with self.pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT event_type, event_date FROM macro_events ORDER BY event_date ASC"
+                )
+            for r in rows:
+                et = r["event_type"]
+                if et in result:
+                    result[et].append(r["event_date"].isoformat())
+        except Exception as exc:
+            logger.warning(f"⚠️  macro_events load failed: {exc}")
+
+        _MACRO_EVENTS_CACHE = (result, today)
+        return result
+
+    async def _fetch_and_store_eps_surprises(self, ticker: str) -> Dict[str, float]:
+        """Fetch EPS surprises from Finnhub, store in earnings_history, return {date_str: pct}.
+
+        Returns an empty dict when FINNHUB_API_KEY is unset or the request fails.
+        """
+        api_key = settings.FINNHUB_API_KEY
+        if not api_key:
+            return {}
+
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(
+                    "https://finnhub.io/api/v1/stock/earnings",
+                    params={"symbol": ticker, "token": api_key},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+        except Exception as exc:
+            logger.warning(f"⚠️  EPS fetch failed for {ticker}: {exc}")
+            return {}
+
+        if not data:
+            return {}
+
+        records: List[tuple] = []
+        eps_map: Dict[str, float] = {}
+
+        for item in data:
+            date_str = item.get("period")
+            if not date_str:
+                continue
+            try:
+                report_date = date.fromisoformat(date_str)
+            except ValueError:
+                continue
+
+            actual   = item.get("actual")
+            estimate = item.get("estimate")
+            surprise_pct = item.get("surprisePercent")
+
+            actual       = float(actual)       if actual       is not None else None
+            estimate     = float(estimate)     if estimate     is not None else None
+            surprise_pct = float(surprise_pct) if surprise_pct is not None else None
+
+            records.append((ticker, report_date, actual, estimate, surprise_pct))
+            if surprise_pct is not None:
+                eps_map[date_str] = surprise_pct
+
+        if records:
+            try:
+                async with self.pool.acquire() as conn:
+                    await conn.executemany(
+                        """
+                        INSERT INTO earnings_history
+                            (ticker, report_date, eps_actual, eps_estimate, eps_surprise_pct)
+                        VALUES ($1, $2, $3, $4, $5)
+                        ON CONFLICT (ticker, report_date) DO UPDATE SET
+                            eps_actual       = EXCLUDED.eps_actual,
+                            eps_estimate     = EXCLUDED.eps_estimate,
+                            eps_surprise_pct = EXCLUDED.eps_surprise_pct,
+                            fetched_at       = NOW()
+                        """,
+                        records,
+                    )
+            except Exception as exc:
+                logger.warning(f"⚠️  EPS store failed for {ticker}: {exc}")
+
+        logger.info(f"✅ EPS surprises for {ticker}: {len(eps_map)} quarters")
+        return eps_map
+
     # ── Indicator computation ─────────────────────────────────────────────────
 
     def _compute_indicators(
@@ -427,6 +541,8 @@ class OHLCVService:
         vix_series: pd.Series = None,
         earnings_dates: pd.DatetimeIndex = None,
         putcall_series: pd.Series = None,
+        macro_events: Optional[Dict[str, List[str]]] = None,
+        eps_history: Optional[Dict[str, float]] = None,
     ) -> pd.DataFrame:
         out = df[["timestamp"]].copy()
         close = df["close"]
@@ -546,6 +662,41 @@ class OHLCVService:
             )
         else:
             out["options_put_call_ratio"] = 1.0
+
+        # ── Macro event countdowns ────────────────────────────────────────────
+        # days_to_next_event uses binary search: O(n log m) per event type.
+        # Neutral fallbacks (30 / 15) chosen to be non-extreme and mid-range
+        # so the model doesn't overfit to the absence of data.
+        me = macro_events or {}
+        out["fomc_days"] = days_to_next_event(bar_dates, me.get("fomc", []), neutral=30.0)
+        out["cpi_days"]  = days_to_next_event(bar_dates, me.get("cpi",  []), neutral=15.0)
+        out["nfp_days"]  = days_to_next_event(bar_dates, me.get("nfp",  []), neutral=15.0)
+
+        # ── EPS surprise % ────────────────────────────────────────────────────
+        # Forward-fill the most recent surprise for up to 30 trading days.
+        # Outside that window (or no data) → 0.0 (no recent surprise signal).
+        if eps_history:
+            eps_sorted = sorted(
+                ((date.fromisoformat(k), v) for k, v in eps_history.items()
+                 if v is not None),
+                key=lambda x: x[0],
+            )
+            eps_dates = np.array([np.datetime64(str(d), "D") for d, _ in eps_sorted], dtype="datetime64[D]")
+            eps_values = np.array([v for _, v in eps_sorted], dtype=np.float32)
+
+            bar_day_arr = bar_dates.values.astype("datetime64[D]")
+            eps_col = np.zeros(len(bar_day_arr), dtype=np.float32)
+
+            for i, bd in enumerate(bar_day_arr):
+                idx = int(np.searchsorted(eps_dates, bd, side="right")) - 1
+                if idx >= 0:
+                    days_since = int((bd - eps_dates[idx]).astype(int))
+                    if days_since <= 30:
+                        eps_col[i] = eps_values[idx]
+
+            out["eps_surprise_pct"] = eps_col
+        else:
+            out["eps_surprise_pct"] = 0.0
 
         return out
 
