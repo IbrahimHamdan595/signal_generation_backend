@@ -71,6 +71,7 @@ class SentimentCrossAttention(nn.Module):
 
         scale  = math.sqrt(self.d_head)
         scores = torch.matmul(Q, K.transpose(-2, -1)) / scale  # (B, H, 1, S)
+        scores = torch.clamp(scores, min=-30.0, max=30.0)       # prevent softmax NaN from extreme init
         attn   = torch.softmax(scores, dim=-1)
         attn   = self.dropout(attn)
 

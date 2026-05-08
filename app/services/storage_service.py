@@ -3,7 +3,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-BUCKET = "ml-checkpoints"
+BUCKET = "ml_checkpoints"
 
 # Files that must survive a server restart
 CHECKPOINT_FILES = [

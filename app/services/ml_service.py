@@ -86,15 +86,15 @@ class MLService:
         model_config = {
             "n_features":         len(FEATURE_COLS),
             "seq_len":            seq_len,
-            "d_model":            128,
-            "n_heads":            8,
-            "n_layers":           3,       # was 2 — deeper encoder captures longer-range macro patterns
+            "d_model":            64,
+            "n_heads":            4,
+            "n_layers":           3,
             "d_ff":               256,
             "sent_input":         4,
-            "sent_dim":           32,
+            "sent_dim":           16,
             "mlp_hidden":         128,
-            "dropout":            0.30,
-            "use_cross_attention": True,   # sentiment cross-attends into price sequence
+            "dropout":            0.40,
+            "use_cross_attention": True,
         }
         model = TradingFusionModel(**model_config)
         total_params = sum(p.numel() for p in model.parameters())

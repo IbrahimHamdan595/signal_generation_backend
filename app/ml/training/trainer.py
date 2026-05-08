@@ -216,12 +216,22 @@ class Trainer:
                 y_reg    = y_reg.to(self.device)
                 y_timing = y_timing.to(self.device)
 
+                # Replace any NaN/inf (e.g. un-ingested macro/EPS columns) with 0
+                # before they can propagate through the model and produce nan loss.
+                x_price = torch.nan_to_num(x_price, nan=0.0, posinf=0.0, neginf=0.0)
+                x_sent  = torch.nan_to_num(x_sent,  nan=0.0, posinf=0.0, neginf=0.0)
+                y_reg   = torch.nan_to_num(y_reg,   nan=0.0, posinf=0.0, neginf=0.0)
+
                 # Gaussian noise augmentation (training only): 0.02σ jitter on
                 # Z-scored inputs — prevents memorising exact feature values.
                 if training:
                     x_price = x_price + torch.randn_like(x_price) * 0.02
 
                 dir_logits, regression, timing_logits = self.model(x_price, x_sent)
+
+                # Skip batch if model output is still NaN (e.g. bad init on small folds)
+                if torch.isnan(dir_logits).any():
+                    continue
 
                 cls_loss    = self.cls_loss_fn(dir_logits, y_cls)
                 reg_loss    = self.reg_loss_fn(regression, y_reg)
@@ -275,6 +285,9 @@ class Trainer:
         logger.info(f"💾 Checkpoint saved → {self.checkpoint_path}")
 
     def load_best(self):
+        if not os.path.exists(self.checkpoint_path):
+            logger.warning(f"⚠️  No checkpoint at {self.checkpoint_path} — keeping current weights")
+            return
         ckpt = torch.load(
             self.checkpoint_path, map_location="cpu", weights_only=True
         )
