@@ -229,10 +229,6 @@ class Trainer:
 
                 dir_logits, regression, timing_logits = self.model(x_price, x_sent)
 
-                # Skip batch if model output is still NaN (e.g. bad init on small folds)
-                if torch.isnan(dir_logits).any():
-                    continue
-
                 cls_loss    = self.cls_loss_fn(dir_logits, y_cls)
                 reg_loss    = self.reg_loss_fn(regression, y_reg)
                 timing_loss = self.timing_loss_fn(timing_logits, y_timing)
@@ -242,6 +238,12 @@ class Trainer:
                     + self.reg_weight  * reg_loss
                     + self.timing_weight * timing_loss
                 )
+
+                # If loss became non-finite despite all input guards, skip the
+                # batch entirely so we never apply a NaN gradient (which would
+                # corrupt every subsequent forward pass).
+                if not torch.isfinite(loss):
+                    continue
 
                 if training:
                     self.optimizer.zero_grad()

@@ -441,6 +441,12 @@ class DatasetBuilder:
             fit_data = X[s:e].reshape(-1, F) if e > s else X.reshape(-1, F)
 
         mean = fit_data.mean(axis=0)
-        std = fit_data.std(axis=0) + 1e-8
+        # Use a meaningful std floor (1e-2) so features that are near-constant
+        # in the fit slice don't blow up to astronomical values when a non-zero
+        # appears later. With 1e-8 floor, a 5% eps_surprise → 5_000_000 → NaN.
+        std = np.maximum(fit_data.std(axis=0), 1e-2)
         X_norm = (X.reshape(-1, F) - mean).reshape(N, T, F) / std
+        # Final safety cap — prevents any remaining outlier from cascading into
+        # transformer overflow on small fold subsets.
+        X_norm = np.clip(X_norm, -10.0, 10.0)
         return X_norm, {"mean": mean.tolist(), "std": std.tolist()}
