@@ -6,6 +6,8 @@ import numpy as np
 import os
 import logging
 
+from sklearn.metrics import f1_score
+
 from app.ml.models.fusion_model import TradingFusionModel
 
 
@@ -23,7 +25,7 @@ class FocalLoss(nn.Module):
         self,
         gamma: float = 2.0,
         weight: Optional[torch.Tensor] = None,
-        label_smoothing: float = 0.1,
+        label_smoothing: float = 0.0,
     ):
         super().__init__()
         self.gamma           = gamma
@@ -74,9 +76,9 @@ class Trainer:
         lr: float = 2e-4,
         weight_decay: float = 5e-4,
         cls_weight: float = 1.0,
-        reg_weight: float = 0.05,
-        timing_weight: float = 0.0,
-        patience: int = 15,
+        reg_weight: float = 0.3,        # was 0.05 — too low, regression head wasn't learning
+        timing_weight: float = 0.1,     # was 0.0 — head was completely untrained (pure noise)
+        patience: int = 8,              # was 15 — tighter early stopping with stronger weights
         checkpoint_name: str = "best_model.pt",
         class_weights: Optional[torch.Tensor] = None,
         timing_class_weights: Optional[torch.Tensor] = None,
@@ -100,10 +102,12 @@ class Trainer:
         self._warmup_epochs = 5
         self.scheduler = None  # built lazily in fit()
 
+        # Label smoothing dropped to 0.0 — soft targets reinforce the majority
+        # class on imbalanced data and contributed to the BUY-everywhere collapse.
         self.cls_loss_fn = FocalLoss(
             gamma=2.0,
             weight=class_weights.to(self.device) if class_weights is not None else None,
-            label_smoothing=0.1,
+            label_smoothing=0.0,
         )
         if class_weights is not None:
             logger.info(f"⚖️  Class weights applied to FocalLoss: {class_weights.tolist()}")
@@ -111,7 +115,7 @@ class Trainer:
         self.reg_loss_fn    = nn.MSELoss()
         self.timing_loss_fn = nn.CrossEntropyLoss(
             weight=timing_class_weights.to(self.device) if timing_class_weights is not None else None,
-            label_smoothing=0.1,
+            label_smoothing=0.0,
         )
 
         self.cls_weight    = cls_weight
@@ -131,15 +135,16 @@ class Trainer:
         val_loader:   DataLoader,
         epochs:       int = 50,
     ) -> dict:
+        best_val_f1      = -1.0
         best_val_loss    = float("inf")
         epochs_no_improve = 0
 
-        # ReduceLROnPlateau: cut LR by 50% when val_loss doesn't improve for 4 epochs.
-        # This adapts to the actual learning curve instead of following a fixed cosine
-        # schedule — critical for financial time series where regimes shift unpredictably.
+        # ReduceLROnPlateau on macro-F1 (mode="max"): step LR down when F1 stops
+        # improving. Tracking F1 instead of loss prevents the scheduler from
+        # rewarding the degenerate "always BUY" minimum-loss solution.
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer,
-            mode="min",
+            mode="max",
             factor=0.5,
             patience=6,
             min_lr=self._base_lr * 0.01,
@@ -155,31 +160,34 @@ class Trainer:
                 for g in self.optimizer.param_groups:
                     g["lr"] = self._base_lr * (0.1 + 0.9 * warm_factor)
 
-            tr_loss, tr_acc, tr_timing_acc, tr_losses = self._run_epoch(train_loader, training=True)
-            va_loss, va_acc, va_timing_acc, va_losses = self._run_epoch(val_loader,   training=False)
+            tr_loss, tr_acc, tr_timing_acc, tr_losses, tr_f1 = self._run_epoch(train_loader, training=True)
+            va_loss, va_acc, va_timing_acc, va_losses, va_f1 = self._run_epoch(val_loader,   training=False)
 
             train_loss, val_loss = tr_loss, va_loss
             train_acc,  val_acc  = tr_acc,  va_acc
 
             if epoch > self._warmup_epochs:
-                self.scheduler.step(val_loss)
+                self.scheduler.step(va_f1)
             self.train_history.append({
-                "loss": tr_loss, "acc": tr_acc, "timing_acc": tr_timing_acc,
+                "loss": tr_loss, "acc": tr_acc, "timing_acc": tr_timing_acc, "macro_f1": tr_f1,
                 "cls_loss": tr_losses[0], "reg_loss": tr_losses[1], "timing_loss": tr_losses[2],
             })
             self.val_history.append({
-                "loss": va_loss, "acc": va_acc, "timing_acc": va_timing_acc,
+                "loss": va_loss, "acc": va_acc, "timing_acc": va_timing_acc, "macro_f1": va_f1,
                 "cls_loss": va_losses[0], "reg_loss": va_losses[1], "timing_loss": va_losses[2],
             })
 
             logger.info(
                 f"Epoch {epoch:03d}/{epochs} | "
-                f"Train loss: {train_loss:.4f} acc: {train_acc:.3f} | "
-                f"Val loss: {val_loss:.4f} acc: {val_acc:.3f} | "
+                f"Train loss: {train_loss:.4f} acc: {train_acc:.3f} f1: {tr_f1:.3f} | "
+                f"Val loss: {val_loss:.4f} acc: {val_acc:.3f} f1: {va_f1:.3f} | "
                 f"timing_acc: {self.val_history[-1].get('timing_acc', 0):.3f}"
             )
 
-            if val_loss < best_val_loss:
+            # Best-checkpoint selection by macro-F1 (treats each class equally,
+            # so the "always BUY" collapse cannot win).
+            if va_f1 > best_val_f1:
+                best_val_f1       = va_f1
                 best_val_loss     = val_loss
                 epochs_no_improve = 0
                 self._save_checkpoint(epoch, val_loss, val_acc)
@@ -189,9 +197,10 @@ class Trainer:
                     logger.info(f"⏹ Early stopping at epoch {epoch}")
                     break
 
-        logger.info(f"✅ Training done. Best val loss: {best_val_loss:.4f}")
+        logger.info(f"✅ Training done. Best val macro-F1: {best_val_f1:.4f} (val_loss={best_val_loss:.4f})")
         return {
             "best_val_loss":  best_val_loss,
+            "best_val_f1":    best_val_f1,
             "train_history":  self.train_history,
             "val_history":    self.val_history,
             "checkpoint":     self.checkpoint_path,
@@ -199,13 +208,15 @@ class Trainer:
 
     # ── Epoch runner ──────────────────────────────────────────────────────────
 
-    def _run_epoch(self, loader: DataLoader, training: bool) -> Tuple[float, float, float, list]:
-        """Returns (total_loss, dir_accuracy, timing_accuracy, [cls_loss, reg_loss, timing_loss])."""
+    def _run_epoch(self, loader: DataLoader, training: bool) -> Tuple[float, float, float, list, float]:
+        """Returns (total_loss, dir_accuracy, timing_accuracy, [cls_loss, reg_loss, timing_loss], macro_f1)."""
         self.model.train() if training else self.model.eval()
 
         total_loss = 0.0
         sum_cls_loss = sum_reg_loss = sum_timing_loss = 0.0
         correct_dir = correct_timing = total = 0
+        all_preds: list = []
+        all_labels: list = []
 
         ctx = torch.enable_grad() if training else torch.no_grad()
         with ctx:
@@ -263,12 +274,22 @@ class Trainer:
                 correct_timing += (preds_timing == y_timing).sum().item()
                 total          += n
 
+                all_preds.append(preds_dir.cpu().numpy())
+                all_labels.append(y_cls.cpu().numpy())
+
         n = max(total, 1)
+        if all_preds:
+            preds_flat  = np.concatenate(all_preds)
+            labels_flat = np.concatenate(all_labels)
+            macro_f1 = float(f1_score(labels_flat, preds_flat, average="macro", zero_division=0))
+        else:
+            macro_f1 = 0.0
         return (
             total_loss / n,
             correct_dir    / n,
             correct_timing / n,
             [sum_cls_loss / n, sum_reg_loss / n, sum_timing_loss / n],
+            macro_f1,
         )
 
     # ── Checkpoint ────────────────────────────────────────────────────────────
@@ -304,21 +325,20 @@ class Trainer:
 
 def compute_class_weights(y_cls: np.ndarray, n_classes: int = 3) -> torch.Tensor:
     """
-    Class weights calibrated to actual label distribution.
+    Linear-inverse class weights to break BUY-everywhere class collapse.
 
-    With real data: BUY~52%, SELL~35%, HOLD~13%.
-    HOLD is the minority — standard inverse-frequency would over-weight HOLD
-    and suppress BUY/SELL confidence. Instead we use mild sqrt-inverse weights
-    so no class dominates training and confidence stays sharp on BUY/SELL.
+    Previous sqrt-inverse weighting was too gentle (max/min ≈ 2x), letting the
+    model collapse into "always predict BUY" because that minimises loss when
+    BUY is the largest class. Linear-inverse weighting gives the proper
+    penalty for misclassifying minority classes.
 
-    Formula: weight[c] = sqrt(total / (n_classes * count[c])), then normalise.
+    Formula: weight[c] = total / (n_classes * count[c]), then normalise.
     """
     counts = np.bincount(y_cls, minlength=n_classes).astype(float)
     counts = np.where(counts == 0, 1, counts)
     total  = counts.sum()
-    # sqrt dampens extreme weights — prevents HOLD from dominating
-    weights = np.sqrt(total / (n_classes * counts))
-    weights = weights / weights.mean()  # normalise so mean == 1
+    weights = total / (n_classes * counts)        # linear inverse frequency
+    weights = weights / weights.mean()             # normalise so mean == 1
     logger.info(
         f"⚖️  Class distribution — "
         f"Hold: {int(counts[0])} ({counts[0]/total:.1%}) w={weights[0]:.2f} | "

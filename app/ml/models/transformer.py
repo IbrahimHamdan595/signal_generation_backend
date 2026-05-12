@@ -57,7 +57,9 @@ class TransformerEncoder(nn.Module):
             nhead=n_heads,
             dim_feedforward=d_ff,
             dropout=dropout,
-            batch_first=True,       # (batch, seq, feat) convention
+            activation="gelu",       # smoother gradient than ReLU; standard for modern transformers
+            batch_first=True,        # (batch, seq, feat) convention
+            norm_first=True,         # pre-LN: more stable training, less reliant on warmup
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
 

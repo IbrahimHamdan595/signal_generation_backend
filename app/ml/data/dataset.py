@@ -10,7 +10,9 @@ logger = logging.getLogger(__name__)
 
 OHLCV_COLS = ["open", "high", "low", "close", "volume"]
 
-INDICATOR_COLS = [
+# Columns fetched from the indicators table. Some of these are kept for
+# transformation (cyclical encoding) and not exposed directly to the model.
+DB_INDICATOR_COLS = [
     "sma_20",
     "sma_50",
     "ema_12",
@@ -59,13 +61,35 @@ INDICATOR_COLS = [
     "earnings_days",
     "social_sentiment",
     "options_put_call_ratio",
-    # Macro event countdowns (days to next FOMC / CPI / NFP release)
     "fomc_days",
     "cpi_days",
     "nfp_days",
-    # EPS surprise % from most recent earnings (forward-filled 30 days)
     "eps_surprise_pct",
 ]
+
+# Features dropped from the model input (still queried from DB but not used):
+#   • is_trading_day               — constant for all rows (all bars are trading days)
+#   • above_sma50/200, higher_high, — binary flags redundant with continuous
+#     lower_low, volume_above_avg,    distances (price_sma50_dist, roc_5/10, etc.)
+#     high_vol_regime
+#   • vix_level, vix_change        — market-wide; same value for all tickers
+#                                    on the same bar, weakens per-ticker signal
+#   • day_of_week, day_of_month,   — replaced with sin/cos cyclical encoding so
+#     month                          the model can learn periodic structure
+_DROPPED_FEATURES = {
+    "is_trading_day",
+    "above_sma50", "above_sma200",
+    "higher_high", "lower_low",
+    "volume_above_avg", "high_vol_regime",
+    "vix_level", "vix_change",
+    "day_of_week", "day_of_month", "month",
+}
+
+# Cyclical replacements computed in _build_ticker from the raw integer columns
+CYCLICAL_FEATURES = ["dow_sin", "dow_cos", "dom_sin", "dom_cos", "month_sin", "month_cos"]
+
+# Final ordered feature list the model actually sees
+INDICATOR_COLS = [c for c in DB_INDICATOR_COLS if c not in _DROPPED_FEATURES] + CYCLICAL_FEATURES
 
 SENTIMENT_COLS = ["avg_positive", "avg_negative", "avg_neutral", "avg_compound"]
 
@@ -146,13 +170,15 @@ class DatasetBuilder:
         all_price, all_sent, all_cls, all_reg, all_timing = [], [], [], [], []
         scaler_params: dict = {}
 
+        # NOTE: this builder returns RAW (un-normalised) price arrays. Callers
+        # are responsible for normalisation so they can fit the scaler on a
+        # train slice only (no val/test leakage). Inference path uses the
+        # saved per-ticker scaler from the trained checkpoint.
         for ticker in tickers:
             try:
                 p, s, c, r, t = await self._build_ticker(ticker, interval, sequence_len)
                 if p is not None and len(p) > 0:
-                    p_norm, t_scaler = self._normalise(p)
-                    scaler_params[ticker] = t_scaler
-                    all_price.append(p_norm)
+                    all_price.append(p)
                     all_sent.append(s)
                     all_cls.append(c)
                     all_reg.append(r)
@@ -199,7 +225,7 @@ class DatasetBuilder:
             ind_rows = await conn.fetch(
                 """
                 SELECT timestamp, """
-                + ", ".join(INDICATOR_COLS)
+                + ", ".join(DB_INDICATOR_COLS)
                 + """
                 FROM indicators
                 WHERE ticker = $1 AND interval = $2
@@ -236,7 +262,7 @@ class DatasetBuilder:
             ["timestamp"] + OHLCV_COLS
         ]
         df_ind = (
-            pd.DataFrame([dict(r) for r in ind_rows])[["timestamp"] + INDICATOR_COLS]
+            pd.DataFrame([dict(r) for r in ind_rows])[["timestamp"] + DB_INDICATOR_COLS]
             if ind_rows
             else pd.DataFrame()
         )
@@ -245,10 +271,24 @@ class DatasetBuilder:
             df = pd.merge(df_ohlcv, df_ind, on="timestamp", how="left")
         else:
             df = df_ohlcv.copy()
-            for col in INDICATOR_COLS:
+            for col in DB_INDICATOR_COLS:
                 df[col] = np.nan
 
         df = df.sort_values("timestamp").reset_index(drop=True)
+
+        # Cyclical encoding: integer time features → (sin, cos) pairs so the
+        # model learns periodic structure (Mon→Sun wrap, Dec→Jan wrap, etc.)
+        # Falls back to 0 when source columns are missing.
+        dow = df["day_of_week"].fillna(0).astype(float)   if "day_of_week" in df.columns else 0.0
+        dom = df["day_of_month"].fillna(1).astype(float)  if "day_of_month" in df.columns else 1.0
+        mon = df["month"].fillna(1).astype(float)         if "month" in df.columns else 1.0
+        df["dow_sin"]   = np.sin(2 * np.pi * dow / 7.0)
+        df["dow_cos"]   = np.cos(2 * np.pi * dow / 7.0)
+        df["dom_sin"]   = np.sin(2 * np.pi * dom / 31.0)
+        df["dom_cos"]   = np.cos(2 * np.pi * dom / 31.0)
+        df["month_sin"] = np.sin(2 * np.pi * mon / 12.0)
+        df["month_cos"] = np.cos(2 * np.pi * mon / 12.0)
+
         df[FEATURE_COLS] = df[FEATURE_COLS].ffill().bfill()
 
         # ── Build per-bar sentiment lookup ────────────────────────────────────

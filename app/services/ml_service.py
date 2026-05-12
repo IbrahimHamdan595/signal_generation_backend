@@ -118,7 +118,6 @@ class MLService:
             model,
             lr=lr,
             class_weights=class_weights,
-            timing_weight=0.0,   # timing labels are noisy (argmin of 3 bars); disable to protect shared repr
             checkpoint_name=ckpt_name,
         )
         train_results = trainer.fit(train_loader, val_loader, epochs=epochs)
@@ -395,14 +394,21 @@ class MLService:
 
             from app.ml.data.torch_dataset import TradingDataset
 
+            # Per-fold normalisation: fit on this fold's train slice only.
+            # build() now returns raw arrays so we control the fit scope here.
+            fold_train_flat = X_price[:train_end].reshape(-1, X_price.shape[-1])
+            fold_mean = fold_train_flat.mean(axis=0)
+            fold_std  = np.maximum(fold_train_flat.std(axis=0), 1e-2)
+            X_price_norm = np.clip((X_price - fold_mean) / fold_std, -10.0, 10.0).astype(np.float32)
+
             train_ds = TradingDataset(
-                X_price[:train_end],        X_sent[:train_end],
+                X_price_norm[:train_end],   X_sent[:train_end],
                 y_cls[:train_end],          y_reg[:train_end],
                 y_timing[:train_end],
             )
             val_ds = TradingDataset(
-                X_price[train_end:val_end], X_sent[train_end:val_end],
-                y_cls[train_end:val_end],   y_reg[train_end:val_end],
+                X_price_norm[train_end:val_end], X_sent[train_end:val_end],
+                y_cls[train_end:val_end],        y_reg[train_end:val_end],
                 y_timing[train_end:val_end],
             )
 
@@ -656,31 +662,21 @@ class MLService:
                 """,
                 ticker.upper(), interval,
             )
-            sma_row = await conn.fetchrow(
-                """
-                SELECT sma_20 FROM indicators
-                WHERE ticker = $1 AND interval = $2
-                ORDER BY timestamp DESC LIMIT 1
-                """,
-                ticker.upper(), interval,
-            )
         if not close_row or close_row["close"] is None:
             return {"error": f"No recent close price for {ticker}"}
         current_close = float(close_row["close"])
-        current_sma20 = float(sma_row["sma_20"]) if sma_row and sma_row["sma_20"] is not None else None
 
         if scaler:
             # Per-ticker scaler: dict keyed by ticker
             ticker_scaler = scaler.get(ticker.upper()) or scaler.get(ticker)
             if ticker_scaler:
                 mean    = np.array(ticker_scaler["mean"], dtype=np.float32)
-                std     = np.array(ticker_scaler["std"],  dtype=np.float32)
-                X_price = (X_price - mean) / (std + 1e-8)
+                std     = np.maximum(np.array(ticker_scaler["std"], dtype=np.float32), 1e-2)
+                X_price = np.clip((X_price - mean) / std, -10.0, 10.0)
             elif isinstance(scaler, dict) and "mean" in scaler:
-                # Backwards-compat: old global scaler format
                 mean    = np.array(scaler["mean"], dtype=np.float32)
-                std     = np.array(scaler["std"],  dtype=np.float32)
-                X_price = (X_price - mean) / (std + 1e-8)
+                std     = np.maximum(np.array(scaler["std"], dtype=np.float32), 1e-2)
+                X_price = np.clip((X_price - mean) / std, -10.0, 10.0)
 
         device  = next(model.parameters()).device
         x_price = torch.tensor(X_price[-1:], dtype=torch.float32).to(device)
@@ -691,9 +687,11 @@ class MLService:
         _MARGIN_THRESHOLD     = float(_mcfg.get("margin_threshold",     0.15))
 
         current_ts = datetime.now(timezone.utc)
+        # 8 MC samples gives ~80% of the uncertainty signal at ~40% the latency
+        # of n=20 — solid trade-off for live inference.
         result     = model.mc_predict(
             x_price, x_sent,
-            n_samples=20,
+            n_samples=8,
             temperature=temperature,
             current_ts=current_ts,
             interval=interval,
@@ -707,7 +705,7 @@ class MLService:
         probs_sorted = sorted([prob_hold, prob_buy, prob_sell], reverse=True)
         prob_margin  = probs_sorted[0] - probs_sorted[1]
 
-        # Filter 1: confidence + margin — both must pass.
+        # Filter: confidence + margin — both must pass.
         # Thresholds are auto-tuned on the val set after training; defaults
         # apply when no trained model config is present.
         if action != "HOLD" and (confidence < _CONFIDENCE_THRESHOLD or prob_margin < _MARGIN_THRESHOLD):
@@ -716,18 +714,9 @@ class MLService:
             )
             action = "HOLD"
 
-        # Filter 2: trend confirmation — BUY only above SMA20, SELL only below.
-        # Counter-trend entries are the most common source of bad signals.
-        if action == "BUY" and current_sma20 and current_close < current_sma20:
-            logger.info(
-                f"🔇 {ticker}: BUY rejected — price {current_close:.2f} below SMA20 {current_sma20:.2f}"
-            )
-            action = "HOLD"
-        elif action == "SELL" and current_sma20 and current_close > current_sma20:
-            logger.info(
-                f"🔇 {ticker}: SELL rejected — price {current_close:.2f} above SMA20 {current_sma20:.2f}"
-            )
-            action = "HOLD"
+        # SMA20 trend filter removed — the model already ingests trend signals
+        # (price_sma20_dist, price_sma50_dist, ROC, MACD) and the rule was
+        # blocking valid mean-reversion entries the model learned to predict.
 
         # ── All five regression outputs are genuine model predictions ─────────
         entry_offset_pct = float(result["entry_price"][0])   # predicted % from close

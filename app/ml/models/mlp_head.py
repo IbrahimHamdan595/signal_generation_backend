@@ -24,14 +24,17 @@ class MLPHead(nn.Module):
     ):
         super().__init__()
 
+        # LayerNorm instead of BatchNorm: stable with imbalanced batches and
+        # at single-sample inference; avoids running-statistic drift between
+        # training and eval mode that previously hurt validation accuracy.
         self.shared = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
-            nn.ReLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.BatchNorm1d(hidden_dim // 2),
-            nn.ReLU(),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.GELU(),
             nn.Dropout(dropout),
         )
 

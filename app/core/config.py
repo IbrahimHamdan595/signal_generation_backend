@@ -39,10 +39,12 @@ class Settings(BaseSettings):
 
     TICKER_LIST_PATH: str = "data/sp500.json"
     MAX_BARS_TO_ENTRY: int = 30
-    # Triple-barrier labeling
+    # Triple-barrier labeling — wider thresholds so HOLD samples reflect real
+    # "no clear move" periods instead of being rare. Previous 1.5%/1.5% gave
+    # only 12% HOLD which let the model collapse into BUY-everywhere.
     LOOKAHEAD_WINDOW: int = 5    # 5 bars ≈ 1 week — short enough to be predictable from momentum
-    BUY_THRESHOLD: float = 0.015 # +1.5% triggers BUY — lower threshold = more signal at 5-bar horizon
-    SELL_THRESHOLD: float = 0.015 # -1.5% triggers SELL
+    BUY_THRESHOLD: float = 0.025 # +2.5% triggers BUY (was 1.5%)
+    SELL_THRESHOLD: float = 0.020 # -2.0% triggers SELL (was 1.5%) — slight asymmetry favours BUY R:R
 
     @model_validator(mode="after")
     def validate_required(self) -> "Settings":
