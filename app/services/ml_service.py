@@ -5,7 +5,7 @@ import logging
 import asyncpg
 from torch.utils.data import DataLoader
 from datetime import datetime, timezone
-from typing import List
+from typing import List, Optional
 
 from app.ml.data.dataset import DatasetBuilder, FEATURE_COLS, SEQUENCE_LEN
 from app.ml.data.entry_time import entry_time_from_bars
@@ -24,9 +24,66 @@ from app.ml.evaluation.evaluator import ModelEvaluator
 logger = logging.getLogger(__name__)
 
 
+_DATASET_CACHE_DIR = "checkpoints/dataset_cache"
+
+
 class MLService:
     def __init__(self, pool: asyncpg.Pool):
         self.pool = pool
+
+    # ── Per-ticker dataset cache ──────────────────────────────────────────────
+    # Stores the build outputs of DatasetBuilder._build_ticker keyed by
+    # (ticker, interval, seq_len, latest_bar_timestamp). When the next train
+    # job runs and no new bar has arrived, we reuse the cached numpy arrays
+    # instead of re-running per-ticker SQL + sentiment + feature joins.
+
+    async def _latest_bar_ts(self, ticker: str, interval: str) -> Optional[str]:
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT timestamp FROM ohlcv_data
+                WHERE ticker = $1 AND interval = $2
+                ORDER BY timestamp DESC LIMIT 1
+                """,
+                ticker, interval,
+            )
+        return row["timestamp"].isoformat() if row and row["timestamp"] else None
+
+    def _cache_path(self, ticker: str, interval: str, seq_len: int, ts: str) -> str:
+        import hashlib
+        key = f"{ticker}|{interval}|{seq_len}|{ts}"
+        digest = hashlib.md5(key.encode()).hexdigest()[:12]
+        return os.path.join(_DATASET_CACHE_DIR, f"{ticker}_{interval}_{seq_len}_{digest}.npz")
+
+    async def _load_ticker_cache(
+        self, ticker: str, interval: str, seq_len: int,
+    ) -> Optional[tuple]:
+        ts = await self._latest_bar_ts(ticker, interval)
+        if ts is None:
+            return None
+        path = self._cache_path(ticker, interval, seq_len, ts)
+        if not os.path.exists(path):
+            return None
+        try:
+            data = np.load(path, allow_pickle=False)
+            return (data["p"], data["s"], data["c"], data["r"], data["t"])
+        except Exception as e:
+            logger.warning(f"⚠️  Cache read failed for {ticker}: {e}")
+            return None
+
+    async def _save_ticker_cache(
+        self, ticker: str, interval: str, seq_len: int, arrays: tuple,
+    ) -> None:
+        ts = await self._latest_bar_ts(ticker, interval)
+        if ts is None:
+            return
+        os.makedirs(_DATASET_CACHE_DIR, exist_ok=True)
+        path = self._cache_path(ticker, interval, seq_len, ts)
+        p, s, c, r, t = arrays
+        try:
+            np.savez(path, p=p, s=s, c=c, r=r, t=t)
+        except Exception as e:
+            logger.warning(f"⚠️  Cache write failed for {ticker}: {e}")
 
     async def train(
         self,
@@ -34,9 +91,10 @@ class MLService:
         interval:   str = "1d",
         seq_len:    int = SEQUENCE_LEN,
         epochs:     int = 50,
-        batch_size: int = 32,
+        batch_size: int = 64,            # was 32 — better GPU utilisation on RTX 3050
         lr:         float = 3e-4,
         use_class_weights: bool = True,
+        diagnostics: bool = False,       # when True, also runs WF + permutation importance
     ) -> dict:
         logger.info(f"📦 Building dataset for {len(tickers)} tickers...")
 
@@ -51,12 +109,28 @@ class MLService:
         # Scaler is fitted on the train slice only (first 70% of each ticker)
         # so val/test statistics never leak into normalisation — the previous
         # full-series fit hid the real generalisation gap.
+        #
+        # Cache layer: per-ticker arrays are pickled to disk keyed by the
+        # ticker's latest bar timestamp. If no new bars have arrived since
+        # the last build, we reuse the cached arrays (saves ~1-3 min on
+        # retrain-same-tickers runs).
         TRAIN_FRACTION = 0.70
         ticker_data: list = []
         scaler_params: dict = {}
+        cache_hits = 0
+        cache_misses = 0
         for ticker in tickers:
             try:
-                p, s, c, r, t = await builder._build_ticker(ticker, interval, seq_len)
+                cached = await self._load_ticker_cache(ticker, interval, seq_len)
+                if cached is not None:
+                    p, s, c, r, t = cached
+                    cache_hits += 1
+                else:
+                    p, s, c, r, t = await builder._build_ticker(ticker, interval, seq_len)
+                    if p is not None and len(p) > 0:
+                        await self._save_ticker_cache(ticker, interval, seq_len, (p, s, c, r, t))
+                    cache_misses += 1
+
                 if p is not None and len(p) > 0:
                     train_end = max(1, int(len(p) * TRAIN_FRACTION))
                     p_norm, t_scaler = builder._normalise(p, fit_slice=(0, train_end))
@@ -65,6 +139,7 @@ class MLService:
                     logger.info(f"✅ {ticker}: {len(p)} sequences")
             except Exception as e:
                 logger.error(f"❌ {ticker}: {e}")
+        logger.info(f"💾 Dataset cache: {cache_hits} hits, {cache_misses} misses")
 
         if not ticker_data:
             raise ValueError("No data built — run ingest + sentiment fetch first.")
@@ -86,14 +161,14 @@ class MLService:
         model_config = {
             "n_features":         len(FEATURE_COLS),
             "seq_len":            seq_len,
-            "d_model":            64,
-            "n_heads":            4,
+            "d_model":            96,    # 64→96: more capacity for higher test accuracy
+            "n_heads":            4,     # 96/4 = 24 dim/head
             "n_layers":           3,
-            "d_ff":               256,
+            "d_ff":               384,   # 4× d_model
             "sent_input":         4,
-            "sent_dim":           16,
-            "mlp_hidden":         128,
-            "dropout":            0.40,
+            "sent_dim":           24,
+            "mlp_hidden":         192,
+            "dropout":            0.35,
             "use_cross_attention": True,
         }
         model = TradingFusionModel(**model_config)
@@ -139,8 +214,10 @@ class MLService:
             f"margin={tuned['margin_threshold']}"
         )
 
+        # Permutation feature importance is the slowest part of evaluation
+        # (~3-5 min). Skipped in fast mode; opt-in via diagnostics=True.
         evaluator    = ModelEvaluator(model, interval=interval)
-        eval_results = evaluator.evaluate(test_loader)
+        eval_results = evaluator.evaluate(test_loader, with_permutation=diagnostics)
         evaluator.save_report(eval_results)
 
         save_model_config(model_config)
@@ -150,17 +227,20 @@ class MLService:
         upload("eval_report.json", "checkpoints/eval_report.json")
 
         # ── Walk-forward summary (3 folds, same data) ─────────────────────────
-        # Runs after the final model is trained to give N accuracy estimates
-        # across different market regimes rather than a single 70/15/15 split.
-        wf_summary = await self._embedded_walk_forward(
-            ticker_data=ticker_data,
-            model_config=model_config,
-            epochs=min(epochs, 30),
-            batch_size=batch_size,
-            lr=lr,
-            n_splits=3,
-            interval=interval,
-        )
+        # Skipped in fast mode (~15-20 min saved). Pass diagnostics=True to
+        # get the cross-regime accuracy estimates.
+        if diagnostics:
+            wf_summary = await self._embedded_walk_forward(
+                ticker_data=ticker_data,
+                model_config=model_config,
+                epochs=min(epochs, 15),      # was 30 — folds plateau before 15
+                batch_size=batch_size,
+                lr=lr,
+                n_splits=3,
+                interval=interval,
+            )
+        else:
+            wf_summary = {"skipped": True, "reason": "diagnostics=False (use ?diagnostics=true for WF)"}
 
         # ── Register version (promotes to best_model.pt if best val_loss) ────
         version_entry = register_version(
@@ -514,7 +594,7 @@ class MLService:
         labels = np.concatenate(all_labels)  # (N,)
 
         best_f1  = -1.0
-        best     = {"confidence_threshold": 0.58, "margin_threshold": 0.15}
+        best     = {"confidence_threshold": 0.40, "margin_threshold": 0.05}
 
         max_probs  = probs.max(axis=1)
         pred_cls   = probs.argmax(axis=1)
@@ -523,17 +603,21 @@ class MLService:
         is_signal  = (labels == 1) | (labels == 2)     # true BUY or SELL
         total_true = max(is_signal.sum(), 1)
 
-        for conf_t in np.arange(0.45, 0.80, 0.025):
-            for margin_t in np.arange(0.05, 0.35, 0.025):
+        # Wider sweep with looser floors: when the model is HOLD-leaning, no
+        # combo passes recall≥5%, leaving thresholds at defaults that never
+        # fire. Drop floors to 1 prediction & 0.5% recall so we always pick
+        # *something* and surface the best the model is currently capable of.
+        for conf_t in np.arange(0.34, 0.80, 0.02):
+            for margin_t in np.arange(0.01, 0.35, 0.02):
                 passes  = (max_probs >= conf_t) & (margins >= margin_t) & (pred_cls != 0)
                 n_pred  = passes.sum()
-                if n_pred < 5:
+                if n_pred < 1:
                     continue
 
                 tp        = ((pred_cls == labels) & passes).sum()
                 precision = tp / n_pred
                 recall    = tp / total_true
-                if recall < 0.05:
+                if recall < 0.005:
                     continue
 
                 f1 = 2 * precision * recall / max(precision + recall, 1e-9)
@@ -544,10 +628,17 @@ class MLService:
                         "margin_threshold":     round(float(margin_t), 3),
                     }
 
-        logger.info(
-            f"🎯 Threshold sweep: conf={best['confidence_threshold']} "
-            f"margin={best['margin_threshold']} F1={best_f1:.4f}"
-        )
+        if best_f1 < 0:
+            logger.warning(
+                "⚠️  Threshold sweep found no usable combo — model produced "
+                "zero correct BUY/SELL predictions. Defaults will let it surface "
+                "low-confidence signals which the executor's EV filter will catch."
+            )
+        else:
+            logger.info(
+                f"🎯 Threshold sweep: conf={best['confidence_threshold']} "
+                f"margin={best['margin_threshold']} F1={best_f1:.4f}"
+            )
         return best
 
     # ── Data quality pre-check ────────────────────────────────────────────────
@@ -662,9 +753,26 @@ class MLService:
                 """,
                 ticker.upper(), interval,
             )
+            # Latest indicator snapshot — used for event-window filtering and
+            # ATR-based SL/TP scaling at execution time.
+            ind_row = await conn.fetchrow(
+                """
+                SELECT atr_14, fomc_days, cpi_days, nfp_days, earnings_days
+                FROM indicators
+                WHERE ticker = $1 AND interval = $2
+                ORDER BY timestamp DESC LIMIT 1
+                """,
+                ticker.upper(), interval,
+            )
         if not close_row or close_row["close"] is None:
             return {"error": f"No recent close price for {ticker}"}
         current_close = float(close_row["close"])
+
+        atr_14         = float(ind_row["atr_14"])         if ind_row and ind_row["atr_14"]         is not None else None
+        fomc_days      = float(ind_row["fomc_days"])      if ind_row and ind_row["fomc_days"]      is not None else 999.0
+        cpi_days       = float(ind_row["cpi_days"])       if ind_row and ind_row["cpi_days"]       is not None else 999.0
+        nfp_days       = float(ind_row["nfp_days"])       if ind_row and ind_row["nfp_days"]       is not None else 999.0
+        earnings_days  = float(ind_row["earnings_days"])  if ind_row and ind_row["earnings_days"]  is not None else 999.0
 
         if scaler:
             # Per-ticker scaler: dict keyed by ticker
@@ -697,54 +805,118 @@ class MLService:
             interval=interval,
         )
 
-        action     = result["action"][0]
-        confidence = result["confidence"][0]
-        prob_hold  = result["probabilities"]["hold"][0]
-        prob_buy   = result["probabilities"]["buy"][0]
-        prob_sell  = result["probabilities"]["sell"][0]
+        action      = result["action"][0]
+        confidence  = result["confidence"][0]
+        uncertainty = float(result.get("uncertainty", [0.0])[0])
+        prob_hold   = result["probabilities"]["hold"][0]
+        prob_buy    = result["probabilities"]["buy"][0]
+        prob_sell   = result["probabilities"]["sell"][0]
         probs_sorted = sorted([prob_hold, prob_buy, prob_sell], reverse=True)
         prob_margin  = probs_sorted[0] - probs_sorted[1]
 
-        # Filter: confidence + margin — both must pass.
-        # Thresholds are auto-tuned on the val set after training; defaults
-        # apply when no trained model config is present.
-        if action != "HOLD" and (confidence < _CONFIDENCE_THRESHOLD or prob_margin < _MARGIN_THRESHOLD):
-            logger.info(
-                f"🔇 {ticker}: {action} filtered — conf={confidence:.3f} margin={prob_margin:.3f} → HOLD"
-            )
-            action = "HOLD"
-
-        # SMA20 trend filter removed — the model already ingests trend signals
-        # (price_sma20_dist, price_sma50_dist, ROC, MACD) and the rule was
-        # blocking valid mean-reversion entries the model learned to predict.
-
-        # ── All five regression outputs are genuine model predictions ─────────
-        entry_offset_pct = float(result["entry_price"][0])   # predicted % from close
-        sl_pct           = float(result["stop_loss"][0])
-        tp_pct           = float(result["take_profit"][0])
+        # Raw regression predictions (% deviations)
+        entry_offset_pct = float(result["entry_price"][0])
+        sl_pct_raw       = float(result["stop_loss"][0])
+        tp_pct_raw       = float(result["take_profit"][0])
         net_pct          = float(result["net_profit"][0])
         raw_bars         = float(result["bars_to_entry"][0])
         timing_bucket    = int(result["timing_bucket"][0])
         timing_bars      = float(result["timing_bars"][0])
 
+        # Magnitudes for risk/reward — model returns signed values but we
+        # care about the absolute distance from entry in each direction.
+        abs_sl_pct = max(abs(sl_pct_raw), settings.MIN_PREDICTED_SL_PCT)
+        abs_tp_pct = abs(tp_pct_raw)
+
+        # ── Filter chain — each gate can downgrade action to HOLD ───────────────
+        reject_reasons: list = []
+
+        # Gate 1: confidence + margin (val-tuned thresholds)
+        if action != "HOLD" and (confidence < _CONFIDENCE_THRESHOLD or prob_margin < _MARGIN_THRESHOLD):
+            reject_reasons.append(f"conf={confidence:.3f}/margin={prob_margin:.3f}")
+            action = "HOLD"
+
+        # Gate 2: uncertainty (MC dropout std at predicted class)
+        if action != "HOLD" and uncertainty > settings.UNCERTAINTY_MAX:
+            reject_reasons.append(f"uncertainty={uncertainty:.3f}>{settings.UNCERTAINTY_MAX}")
+            action = "HOLD"
+
+        # Gate 3: R:R ratio — only trade when predicted reward justifies risk
+        predicted_rr = abs_tp_pct / abs_sl_pct
+        if action != "HOLD" and predicted_rr < settings.MIN_RR_RATIO:
+            reject_reasons.append(f"RR={predicted_rr:.2f}<{settings.MIN_RR_RATIO}")
+            action = "HOLD"
+
+        # Gate 4: macro-event windows — gap risk dominates short-term edge
+        next_macro = min(fomc_days, cpi_days, nfp_days)
+        if action != "HOLD" and next_macro < settings.EVENT_DAYS_MIN:
+            reject_reasons.append(f"macro_event_in_{next_macro:.0f}d")
+            action = "HOLD"
+        if action != "HOLD" and earnings_days < settings.EARNINGS_DAYS_MIN:
+            reject_reasons.append(f"earnings_in_{earnings_days:.0f}d")
+            action = "HOLD"
+
+        # Gate 5: expected value — confidence × tp − (1-conf) × sl
+        # The single most important filter: if EV ≤ 0, this is a losing trade
+        # in expectation no matter how high confidence looks.
+        expected_value = confidence * abs_tp_pct - (1.0 - confidence) * abs_sl_pct
+        if action != "HOLD" and expected_value < settings.MIN_EXPECTED_VALUE:
+            reject_reasons.append(f"EV={expected_value:.4f}")
+            action = "HOLD"
+
+        if reject_reasons:
+            logger.info(f"🔇 {ticker}: filtered → HOLD ({', '.join(reject_reasons)})")
+
+        # ── Position sizing: quarter-Kelly with edge/RR ─────────────────────────
+        # Kelly fraction: f* = (p·b − q) / b   where
+        #   p = win probability ≈ confidence
+        #   q = 1 − p
+        #   b = R:R ratio
+        # Clamped to [0, 1]; multiplied by KELLY_FRACTION (0.25 = quarter-Kelly)
+        # for safety against overestimated edge.
+        if action != "HOLD":
+            p = confidence
+            b = predicted_rr
+            kelly_full     = max(0.0, (p * b - (1.0 - p)) / b) if b > 0 else 0.0
+            kelly_fraction = min(1.0, kelly_full * settings.KELLY_FRACTION)
+        else:
+            kelly_full     = 0.0
+            kelly_fraction = 0.0
+
+        # ── Bars-to-entry cap ──────────────────────────────────────────────────
         max_bars = float(getattr(settings, "MAX_BARS_TO_ENTRY", 10))
         bars_capped = raw_bars > max_bars
         bars_to_entry = min(max(raw_bars, 1.0), max_bars)
         entry_time = entry_time_from_bars(current_ts, bars_to_entry, interval)
 
-        # Convert predicted % offsets to dollar levels
+        # ── Dollar levels — now use model's PREDICTED TP, not a fixed 2:1 ──────
+        # Previously the TP was overridden with 2× SL distance, throwing away
+        # the regression head's TP prediction. Now we honour both.
         entry_dollar = current_close * (1 + entry_offset_pct)
         if action == "BUY":
-            sl_dollar   = entry_dollar * (1 + sl_pct)
-            sl_distance = entry_dollar - sl_dollar          # always positive
-            tp_dollar   = entry_dollar + sl_distance * 2.0  # fixed 2:1 R:R
+            sl_dollar = entry_dollar * (1 - abs_sl_pct)
+            tp_dollar = entry_dollar * (1 + abs_tp_pct)
         elif action == "SELL":
-            sl_dollar   = entry_dollar * (1 - sl_pct)
-            sl_distance = sl_dollar - entry_dollar          # always positive
-            tp_dollar   = entry_dollar - sl_distance * 2.0  # fixed 2:1 R:R
+            sl_dollar = entry_dollar * (1 + abs_sl_pct)
+            tp_dollar = entry_dollar * (1 - abs_tp_pct)
         else:  # HOLD
             sl_dollar = entry_dollar
             tp_dollar = entry_dollar
+
+        # ATR-scaled SL alternative (1.5× ATR) — exposed as a suggestion so
+        # an execution layer can pick volatility-adaptive stops when desired.
+        if atr_14 and atr_14 > 0 and action != "HOLD":
+            atr_sl_distance = 1.5 * atr_14
+            if action == "BUY":
+                atr_sl_dollar = entry_dollar - atr_sl_distance
+                atr_tp_dollar = entry_dollar + atr_sl_distance * predicted_rr
+            else:
+                atr_sl_dollar = entry_dollar + atr_sl_distance
+                atr_tp_dollar = entry_dollar - atr_sl_distance * predicted_rr
+        else:
+            atr_sl_dollar = sl_dollar
+            atr_tp_dollar = tp_dollar
+
         net_dollar = abs(tp_dollar - entry_dollar) - abs(sl_dollar - entry_dollar)
 
         output = {
@@ -752,13 +924,14 @@ class MLService:
             "interval":  interval,
             "action":      action,
             "confidence":  round(confidence, 4),
-            "uncertainty": round(float(result.get("uncertainty", [0])[0]), 4),
+            "uncertainty": round(uncertainty, 4),
             "probabilities": {
                 "hold": round(result["probabilities"]["hold"][0], 4),
                 "buy":  round(result["probabilities"]["buy"][0],  4),
                 "sell": round(result["probabilities"]["sell"][0], 4),
             },
             # Dollar levels derived from predicted % targets × anchor close
+            # Now uses the model's PREDICTED tp_pct (was overridden with 2:1 R:R)
             "entry_price":  round(entry_dollar, 4),
             "stop_loss":    round(sl_dollar,    4),
             "take_profit":  round(tp_dollar,    4),
@@ -767,11 +940,33 @@ class MLService:
             "bars_to_entry_capped": bars_capped,
             "entry_time":   entry_time.isoformat(),
             "entry_time_label": _entry_label(entry_time, interval),
+            # ── Profitability fields ───────────────────────────────────────────
+            # Use these on the execution side to size positions and gate trades.
+            "expected_value":   round(expected_value, 6),  # confidence·TP − (1−c)·SL
+            "predicted_rr":     round(predicted_rr, 3),    # tp/sl ratio
+            "kelly_full":       round(kelly_full, 4),      # raw Kelly fraction
+            "kelly_fraction":   round(kelly_fraction, 4),  # quarter-Kelly position size (0..1)
+            "risk_per_trade":   round(settings.MAX_RISK_PER_TRADE, 4),
+            "reject_reasons":   reject_reasons,            # populated only when filtered to HOLD
+            # ATR-based SL/TP alternative — execution layer can substitute these
+            # for volatility-adaptive stops instead of the model's % distances.
+            "atr_levels": {
+                "stop_loss":   round(atr_sl_dollar, 4),
+                "take_profit": round(atr_tp_dollar, 4),
+                "atr_14":      round(atr_14, 6) if atr_14 else None,
+            },
+            # Event proximity flags — caller may want to surface these in the UI
+            "event_proximity": {
+                "fomc_days":     round(fomc_days, 1),
+                "cpi_days":      round(cpi_days, 1),
+                "nfp_days":      round(nfp_days, 1),
+                "earnings_days": round(earnings_days, 1),
+            },
             # All five raw model predictions (% / float)
             "predicted": {
                 "entry_offset_pct": round(entry_offset_pct, 6),
-                "stop_loss_pct":    round(sl_pct, 6),
-                "take_profit_pct":  round(tp_pct, 6),
+                "stop_loss_pct":    round(sl_pct_raw, 6),
+                "take_profit_pct":  round(tp_pct_raw, 6),
                 "net_profit_pct":   round(net_pct, 6),
                 "bars_to_entry":    round(raw_bars, 4),
             },

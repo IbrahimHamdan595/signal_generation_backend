@@ -63,6 +63,13 @@ class SignalService:
         bucket     = timing.get("bucket")
         bucket_label = timing.get("bucket_label")
 
+        # Profit-engineering fields populated by predict_ticker (filter gates,
+        # EV, Kelly sizing, event proximity, ATR-based levels). The execution
+        # layer reads kelly_fraction / expected_value from these columns.
+        atr_levels   = result.get("atr_levels", {}) or {}
+        event_prox   = result.get("event_proximity", {}) or {}
+        reject_json  = json.dumps(result.get("reject_reasons", []))
+
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
@@ -72,29 +79,46 @@ class SignalService:
                     bars_to_entry, entry_time, entry_time_label,
                     prob_buy, prob_sell, prob_hold,
                     entry_offset_pct, timing_bucket, timing_bucket_label,
+                    uncertainty, predicted_rr, expected_value,
+                    kelly_full, kelly_fraction, reject_reasons,
+                    atr_stop_loss, atr_take_profit,
+                    fomc_days, cpi_days, nfp_days, earnings_days,
                     source, created_at
                 ) VALUES (
-                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-                    $12, $13, $14, $15, $16, $17, $18, $19
+                    $1,  $2,  $3,  $4,  $5,  $6,  $7,  $8,  $9,  $10,
+                    $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
+                    $21, $22, $23::jsonb, $24, $25, $26, $27, $28, $29, $30, $31
                 )
                 ON CONFLICT (ticker, interval, DATE(created_at AT TIME ZONE 'UTC'))
                 DO UPDATE SET
-                    action             = EXCLUDED.action,
-                    confidence         = EXCLUDED.confidence,
-                    entry_price        = EXCLUDED.entry_price,
-                    stop_loss          = EXCLUDED.stop_loss,
-                    take_profit        = EXCLUDED.take_profit,
-                    net_profit         = EXCLUDED.net_profit,
-                    bars_to_entry      = EXCLUDED.bars_to_entry,
-                    entry_time         = EXCLUDED.entry_time,
-                    entry_time_label   = EXCLUDED.entry_time_label,
-                    prob_buy           = EXCLUDED.prob_buy,
-                    prob_sell          = EXCLUDED.prob_sell,
-                    prob_hold          = EXCLUDED.prob_hold,
-                    entry_offset_pct   = EXCLUDED.entry_offset_pct,
-                    timing_bucket      = EXCLUDED.timing_bucket,
+                    action              = EXCLUDED.action,
+                    confidence          = EXCLUDED.confidence,
+                    entry_price         = EXCLUDED.entry_price,
+                    stop_loss           = EXCLUDED.stop_loss,
+                    take_profit         = EXCLUDED.take_profit,
+                    net_profit          = EXCLUDED.net_profit,
+                    bars_to_entry       = EXCLUDED.bars_to_entry,
+                    entry_time          = EXCLUDED.entry_time,
+                    entry_time_label    = EXCLUDED.entry_time_label,
+                    prob_buy            = EXCLUDED.prob_buy,
+                    prob_sell           = EXCLUDED.prob_sell,
+                    prob_hold           = EXCLUDED.prob_hold,
+                    entry_offset_pct    = EXCLUDED.entry_offset_pct,
+                    timing_bucket       = EXCLUDED.timing_bucket,
                     timing_bucket_label = EXCLUDED.timing_bucket_label,
-                    created_at         = EXCLUDED.created_at
+                    uncertainty         = EXCLUDED.uncertainty,
+                    predicted_rr        = EXCLUDED.predicted_rr,
+                    expected_value      = EXCLUDED.expected_value,
+                    kelly_full          = EXCLUDED.kelly_full,
+                    kelly_fraction      = EXCLUDED.kelly_fraction,
+                    reject_reasons      = EXCLUDED.reject_reasons,
+                    atr_stop_loss       = EXCLUDED.atr_stop_loss,
+                    atr_take_profit     = EXCLUDED.atr_take_profit,
+                    fomc_days           = EXCLUDED.fomc_days,
+                    cpi_days            = EXCLUDED.cpi_days,
+                    nfp_days            = EXCLUDED.nfp_days,
+                    earnings_days       = EXCLUDED.earnings_days,
+                    created_at          = EXCLUDED.created_at
                 RETURNING *
                 """,
                 ticker,
@@ -114,6 +138,18 @@ class SignalService:
                 predicted.get("entry_offset_pct"),
                 bucket,
                 bucket_label,
+                result.get("uncertainty"),
+                result.get("predicted_rr"),
+                result.get("expected_value"),
+                result.get("kelly_full"),
+                result.get("kelly_fraction"),
+                reject_json,
+                atr_levels.get("stop_loss"),
+                atr_levels.get("take_profit"),
+                event_prox.get("fomc_days"),
+                event_prox.get("cpi_days"),
+                event_prox.get("nfp_days"),
+                event_prox.get("earnings_days"),
                 "ml_model",
                 datetime.now(timezone.utc),
             )

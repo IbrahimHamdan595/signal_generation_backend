@@ -110,8 +110,8 @@ async def refresh_daily_data():
             logger.info("⏭  Daily refresh skipped — no tracked tickers.")
             return
         svc = OHLCVService(pool)
-        success, failed, count = await svc.ingest_tickers(tickers, "1d", "2y")
-        logger.info(f"✅ Daily refresh: {count} records | failed: {failed}")
+        success, failed, count, _ = await svc.ingest_tickers(tickers, "1d", "2y")
+        logger.info(f"✅ Daily refresh: {count} records | failed: {len(failed)}")
     except Exception as e:
         logger.error(f"❌ Daily refresh error: {e}")
         raise
@@ -126,8 +126,9 @@ async def refresh_hourly_data():
             logger.info("⏭  Hourly refresh skipped — no tracked tickers.")
             return
         svc = OHLCVService(pool)
-        success, failed, count = await svc.ingest_tickers(tickers, "1h", "7d")
-        logger.info(f"✅ Hourly refresh: {count} records | failed: {failed}")
+        # ingest_tickers returns (success, failed, total, failed_details)
+        success, failed, count, _ = await svc.ingest_tickers(tickers, "1h", "7d")
+        logger.info(f"✅ Hourly refresh: {count} records | failed: {len(failed)}")
     except Exception as e:
         logger.error(f"❌ Hourly refresh error: {e}")
         raise
@@ -337,8 +338,8 @@ async def refresh_post_market():
             logger.info("⏭  Post-market refresh skipped — no tracked tickers.")
             return
         svc = OHLCVService(pool)
-        success, failed, count = await svc.ingest_tickers(tickers, "1d", "5d")
-        logger.info(f"✅ Post-market refresh: {count} records | failed: {failed}")
+        success, failed, count, _ = await svc.ingest_tickers(tickers, "1d", "5d")
+        logger.info(f"✅ Post-market refresh: {count} records | failed: {len(failed)}")
     except Exception as e:
         logger.error(f"❌ Post-market refresh error: {e}")
         raise

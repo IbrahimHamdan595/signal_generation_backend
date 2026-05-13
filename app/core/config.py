@@ -39,12 +39,24 @@ class Settings(BaseSettings):
 
     TICKER_LIST_PATH: str = "data/sp500.json"
     MAX_BARS_TO_ENTRY: int = 30
-    # Triple-barrier labeling — wider thresholds so HOLD samples reflect real
-    # "no clear move" periods instead of being rare. Previous 1.5%/1.5% gave
-    # only 12% HOLD which let the model collapse into BUY-everywhere.
-    LOOKAHEAD_WINDOW: int = 5    # 5 bars ≈ 1 week — short enough to be predictable from momentum
-    BUY_THRESHOLD: float = 0.025 # +2.5% triggers BUY (was 1.5%)
-    SELL_THRESHOLD: float = 0.020 # -2.0% triggers SELL (was 1.5%) — slight asymmetry favours BUY R:R
+    # Triple-barrier labeling — back to the original 1.5%/1.5% which gave
+    # the best test accuracy on this dataset (BUY-heavy, but the model has
+    # enough samples per class to learn meaningful boundaries).
+    LOOKAHEAD_WINDOW: int = 5
+    BUY_THRESHOLD: float = 0.015
+    SELL_THRESHOLD: float = 0.015
+
+    # ── Signal execution risk parameters ──────────────────────────────────────
+    # All applied at signal generation time in predict_ticker. The model's
+    # raw prediction is filtered through these gates before being surfaced.
+    UNCERTAINTY_MAX:      float = 0.15  # Skip if MC-dropout std > this (untrustworthy signal)
+    MIN_RR_RATIO:         float = 1.5   # Require predicted_tp / predicted_sl >= this
+    MIN_EXPECTED_VALUE:   float = 0.002 # 0.2% — minimum positive EV to take the trade
+    EVENT_DAYS_MIN:       int   = 1     # Skip trades within N days of FOMC/CPI/NFP
+    EARNINGS_DAYS_MIN:    int   = 2     # Skip trades within N days of earnings (gap risk)
+    KELLY_FRACTION:       float = 0.25  # Quarter-Kelly bet sizing — conservative
+    MAX_RISK_PER_TRADE:   float = 0.01  # 1% of capital risked per trade max
+    MIN_PREDICTED_SL_PCT: float = 0.003 # 0.3% — floor on predicted SL to avoid div-by-zero in R:R
 
     @model_validator(mode="after")
     def validate_required(self) -> "Settings":

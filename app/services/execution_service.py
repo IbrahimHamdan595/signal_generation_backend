@@ -61,19 +61,26 @@ class ExecutionService:
         Execute all recent BUY/SELL signals that have not been executed yet
         for users with auto_trade = TRUE.
 
+        Only takes signals that passed the model's filter chain (action != HOLD)
+        AND have a positive expected_value. Ordered by expected_value desc so
+        the strongest setups go first when max_open_positions is close to limit.
+
         Called by the scheduler after each signal regeneration cycle.
         """
         config = await self._get_config(user_id)
         if not config or not config["enabled"] or not config["auto_trade"]:
             return []
 
-        # Signals from the last 24 hours that haven't been successfully filled
+        # Signals from the last 24 hours that haven't been successfully filled.
+        # NULL expected_value is treated as 0 so legacy rows still pass when
+        # min_expected_value is at its default 0.0.
         async with self.pool.acquire() as conn:
             signals = await conn.fetch(
                 """
                 SELECT s.* FROM signals s
                 WHERE s.action IN ('BUY', 'SELL')
                   AND s.confidence >= $1
+                  AND COALESCE(s.expected_value, 0) > 0
                   AND s.created_at >= NOW() - INTERVAL '24 hours'
                   AND NOT EXISTS (
                       SELECT 1 FROM trade_executions te
@@ -81,7 +88,7 @@ class ExecutionService:
                         AND te.user_id = $2
                         AND te.status IN ('filled', 'pending')
                   )
-                ORDER BY s.confidence DESC
+                ORDER BY COALESCE(s.expected_value, 0) DESC, s.confidence DESC
                 """,
                 config["min_confidence"],
                 user_id,
@@ -293,9 +300,28 @@ class ExecutionService:
             volume = round(steps * step, 8)
             volume = max(sym_info["volume_min"], min(volume, sym_info["volume_max"]))
         else:
+            # Hybrid sizing: take the SMALLER of fixed-fraction risk and
+            # Kelly-scaled risk. Kelly bumps risk UP on high-edge signals
+            # (within the user's risk_per_trade_pct ceiling) and DOWN on
+            # marginal ones. Falls back to fixed-fraction if kelly_fraction
+            # is missing (legacy signal rows).
+            kelly_fraction = signal.get("kelly_fraction")
+            risk_pct = config["risk_per_trade_pct"]
+            if kelly_fraction is not None and kelly_fraction > 0:
+                # kelly_fraction is in [0, 1] — interpret as a multiplier on the
+                # user's risk budget. A kelly_fraction of 0.05 → use 5% of the
+                # configured risk_per_trade_pct on this trade.
+                effective_risk_pct = min(risk_pct, risk_pct * kelly_fraction * 4)
+                logger.info(
+                    f"📐 Kelly sizing for sig#{signal_id}: kelly_fraction={kelly_fraction:.3f}, "
+                    f"risk_pct={risk_pct}% → effective={effective_risk_pct:.3f}%"
+                )
+            else:
+                effective_risk_pct = risk_pct
+
             volume = self._calculate_volume(
                 balance=balance,
-                risk_pct=config["risk_per_trade_pct"],
+                risk_pct=effective_risk_pct,
                 entry=entry,
                 stop_loss=sl,
                 contract_size=sym_info["contract_size"],

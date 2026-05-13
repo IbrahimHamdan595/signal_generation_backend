@@ -279,19 +279,39 @@ async def run_now(
     signal_svc = SignalService(pool)
     signals = await signal_svc.generate_batch(valid_tickers, "1d")
 
+    # Diagnostic breakdown of the new profit-filter gates: how many signals
+    # were downgraded to HOLD and the reasons. Surfaced to the UI so users
+    # can see which gates are killing trades.
+    actionable     = [s for s in signals if s.get("action") in ("BUY", "SELL")]
+    filtered_hold  = [s for s in signals if s.get("action") == "HOLD" and s.get("reject_reasons")]
+    reason_counts: dict[str, int] = {}
+    for s in filtered_hold:
+        for r in (s.get("reject_reasons") or []):
+            # First token is the gate name (e.g. "conf=", "uncertainty=", "EV=")
+            key = (r.split("=")[0] if "=" in r else r.split("<")[0]).strip()
+            reason_counts[key] = reason_counts.get(key, 0) + 1
+
     # 4. Auto-execute new signals
     results = await exec_svc.auto_execute(current_user["id"])
     filled = [r for r in results if r.get("ok")]
     failed = [r for r in results if not r.get("ok")]
 
+    # Aggregate expected value across actionable signals (rough P&L forecast
+    # — sums confidence-weighted edge across all BUY/SELL signals generated)
+    total_ev = sum(float(s.get("expected_value") or 0.0) for s in actionable)
+
     return {
-        "signals_generated": len(signals),
-        "orders_attempted": len(results),
-        "orders_filled": len(filled),
-        "orders_failed": len(failed),
-        "skipped_tickers": invalid_tickers,
-        "filled": filled,
-        "failed": failed,
+        "signals_generated":  len(signals),
+        "signals_actionable": len(actionable),
+        "signals_filtered":   len(filtered_hold),
+        "filter_breakdown":   reason_counts,
+        "total_expected_value": round(total_ev, 6),
+        "orders_attempted":   len(results),
+        "orders_filled":      len(filled),
+        "orders_failed":      len(failed),
+        "skipped_tickers":    invalid_tickers,
+        "filled":             filled,
+        "failed":             failed,
     }
 
 

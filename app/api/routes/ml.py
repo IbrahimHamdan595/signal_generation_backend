@@ -76,7 +76,13 @@ async def train_model(
     background_tasks: BackgroundTasks,
     pool=Depends(get_db),
     current_user=Depends(get_current_active_user),
+    diagnostics: bool = False,
 ):
+    """
+    Train a fresh model. When `diagnostics=true` (query param), also runs the
+    embedded 3-fold walk-forward and permutation feature-importance. These
+    add ~20 minutes; default fast mode skips them.
+    """
     if len(body.tickers) < 1:
         raise HTTPException(400, "Provide at least 1 ticker for training")
     if len(body.tickers) > 100:
@@ -97,6 +103,7 @@ async def train_model(
                 batch_size=body.batch_size,
                 lr=body.lr,
                 use_class_weights=body.use_class_weights,
+                diagnostics=diagnostics,
             )
             import json
 
@@ -127,6 +134,7 @@ async def train_model_sync(
     body: TrainRequest,
     pool=Depends(get_db),
     current_user=Depends(get_current_active_user),
+    diagnostics: bool = False,
 ):
     if len(body.tickers) > 20:
         raise HTTPException(400, "Use /ml/train (background) for > 20 tickers")
@@ -140,6 +148,7 @@ async def train_model_sync(
         batch_size=body.batch_size,
         lr=body.lr,
         use_class_weights=body.use_class_weights,
+        diagnostics=diagnostics,
     )
     return result
 

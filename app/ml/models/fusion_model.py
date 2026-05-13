@@ -205,14 +205,19 @@ class TradingFusionModel(nn.Module):
 
         mean_dp  = dp.mean(dim=0)    # (batch, 3)
         std_dp   = dp.std(dim=0)     # (batch, 3)
+        # Median is more robust to outlier MC passes than the mean — a single
+        # extreme dropout sample can pull the mean off, but the median sits
+        # on the actual centre of mass of the prediction distribution.
+        median_dp = dp.median(dim=0).values
         mean_reg = reg.mean(dim=0)   # (batch, 5)
         mean_tp  = tp.mean(dim=0)    # (batch, 4)
 
-        labels        = mean_dp.argmax(dim=-1)
-        mean_max_prob = mean_dp.max(dim=-1).values
-        # std at the predicted class — high std = model disagrees across passes
-        std_at_pred   = std_dp.gather(1, labels.unsqueeze(1)).squeeze(1)
-        confidence    = (mean_max_prob - 0.5 * std_at_pred).clamp(0.0, 1.0)
+        labels         = median_dp.argmax(dim=-1)
+        median_max_p   = median_dp.gather(1, labels.unsqueeze(1)).squeeze(1)
+        std_at_pred    = std_dp.gather(1, labels.unsqueeze(1)).squeeze(1)
+        # Confidence = median prob at predicted class − std penalty
+        # High std across MC passes = model is overfitting that input → penalise
+        confidence    = (median_max_p - 0.5 * std_at_pred).clamp(0.0, 1.0)
 
         timing_buckets = mean_tp.argmax(dim=-1)
         label_map      = {0: "HOLD", 1: "BUY", 2: "SELL"}

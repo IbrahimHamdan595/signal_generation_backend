@@ -46,7 +46,7 @@ class ModelEvaluator:
         self.model.to(self.device)
         self.interval = interval
 
-    def evaluate(self, test_loader: DataLoader) -> dict:
+    def evaluate(self, test_loader: DataLoader, with_permutation: bool = True) -> dict:
         self.model.eval()
 
         all_preds, all_true               = [], []
@@ -154,9 +154,15 @@ class ModelEvaluator:
         )
 
         # ── Permutation feature importance ────────────────────────────────────
-        results["feature_importance"] = self._permutation_importance(
-            test_loader, base_accuracy=results["accuracy"]
-        )
+        # Slow (~3-5 min); skip in fast mode and report a placeholder so the
+        # downstream UI doesn't break on missing keys.
+        if with_permutation:
+            results["feature_importance"] = self._permutation_importance(
+                test_loader, base_accuracy=results["accuracy"]
+            )
+        else:
+            results["feature_importance"] = []
+            results["feature_importance_skipped"] = True
 
         # ── Drift baseline — save test-set probability distribution ───────────
         self._save_drift_baseline(test_loader, results)
