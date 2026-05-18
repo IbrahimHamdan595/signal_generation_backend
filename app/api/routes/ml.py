@@ -3,7 +3,7 @@ from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks, Request
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 from pydantic import BaseModel, Field
-from typing import List
+from typing import List, Optional
 
 from app.core.security import get_current_active_user
 
@@ -32,6 +32,37 @@ class TrainRequest(BaseModel):
             "the data's natural imbalance through gives a more confident model."
         ),
     )
+    # ── Asset class + label overrides for the multi-pipeline setup ────────────
+    # asset_class selects which per-class checkpoint folder the model + its
+    # config/scaler land in (`checkpoints/equities/` vs `checkpoints/fx/`).
+    # The three threshold overrides let FX runs use tighter barriers than
+    # equities — daily FX volatility is much smaller, so the equity 2% / 15-bar
+    # labels would produce HOLD-only datasets.
+    asset_class: str = Field(
+        default="equities",
+        description="Checkpoint namespace: 'equities' or 'fx'. Controls where the model + config get saved.",
+    )
+    buy_threshold: Optional[float] = Field(
+        default=None, gt=0, lt=1,
+        description="Override config.BUY_THRESHOLD for this training run (e.g. 0.012 for FX).",
+    )
+    sell_threshold: Optional[float] = Field(
+        default=None, gt=0, lt=1,
+        description="Override config.SELL_THRESHOLD for this training run.",
+    )
+    lookahead_window: Optional[int] = Field(
+        default=None, ge=1, le=60,
+        description="Override config.LOOKAHEAD_WINDOW (bars) for this training run.",
+    )
+    barrier_atr_mult: Optional[float] = Field(
+        default=None, gt=0, le=10,
+        description=(
+            "When set, switches to volatility-normalised labelling: each "
+            "bar's barrier becomes `mult × ATR(t) / close(t)`. Recommended "
+            "for FX/metals where per-pair daily volatility ranges from "
+            "0.3% (USDHKD) to 1.5%+ (XAUUSD). Typical value: 1.5."
+        ),
+    )
 
 
 class PredictRequest(BaseModel):
@@ -40,24 +71,28 @@ class PredictRequest(BaseModel):
 
 
 @router.get("/status")
-async def model_status(current_user=Depends(get_current_active_user)):
+async def model_status(
+    asset_class: str = "equities",
+    current_user=Depends(get_current_active_user),
+):
     import os
     import json
+    from app.ml.models.registry import _paths_for, _normalize_asset_class
 
-    trained = is_model_trained()
-    info = {}
+    ac = _normalize_asset_class(asset_class)
+    paths = _paths_for(ac)
+
+    trained = is_model_trained(ac)
+    info = {"asset_class": ac}
 
     if trained:
-        ckpt_path = "checkpoints/best_model.pt"
-        eval_path = "checkpoints/eval_report.json"
-
         import torch
-
-        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+        ckpt = torch.load(paths["model"], map_location="cpu", weights_only=True)
         info["epoch"] = ckpt.get("epoch")
         info["val_loss"] = ckpt.get("val_loss")
         info["val_acc"] = ckpt.get("val_acc")
 
+        eval_path = os.path.join(paths["dir"], "eval_report.json")
         if os.path.exists(eval_path):
             with open(eval_path) as f:
                 report = json.load(f)
@@ -104,10 +139,22 @@ async def train_model(
                 lr=body.lr,
                 use_class_weights=body.use_class_weights,
                 diagnostics=diagnostics,
+                asset_class=body.asset_class,
+                buy_threshold=body.buy_threshold,
+                sell_threshold=body.sell_threshold,
+                lookahead_window=body.lookahead_window,
+                barrier_atr_mult=body.barrier_atr_mult,
             )
             import json
+            import os as _os
 
-            with open("checkpoints/last_train_result.json", "w") as f:
+            # Persist last_train_result.json into the asset-class subfolder
+            # so equities and fx runs don't trample each other.
+            ac = (body.asset_class or "equities").lower()
+            ac = "equities" if ac in ("equity", "equities") else "fx"
+            out_dir = _os.path.join("checkpoints", ac)
+            _os.makedirs(out_dir, exist_ok=True)
+            with open(_os.path.join(out_dir, "last_train_result.json"), "w") as f:
                 json.dump(result, f, indent=2, default=str)
             await _job_svc.complete(job_id, {
                 "tickers": len(body.tickers),
@@ -149,6 +196,11 @@ async def train_model_sync(
         lr=body.lr,
         use_class_weights=body.use_class_weights,
         diagnostics=diagnostics,
+        asset_class=body.asset_class,
+        buy_threshold=body.buy_threshold,
+        sell_threshold=body.sell_threshold,
+        lookahead_window=body.lookahead_window,
+        barrier_atr_mult=body.barrier_atr_mult,
     )
     return result
 
@@ -174,25 +226,35 @@ async def predict(
 
 
 @router.get("/report")
-async def get_eval_report(current_user=Depends(get_current_active_user)):
+async def get_eval_report(
+    asset_class: str = "equities",
+    current_user=Depends(get_current_active_user),
+):
     import os
     import json
+    from app.ml.models.registry import _paths_for, _normalize_asset_class
 
-    path = "checkpoints/eval_report.json"
+    ac = _normalize_asset_class(asset_class)
+    path = os.path.join(_paths_for(ac)["dir"], "eval_report.json")
     if not os.path.exists(path):
-        raise HTTPException(404, "No evaluation report found. Train the model first.")
+        raise HTTPException(404, f"No evaluation report for {ac}. Train the model first.")
     with open(path) as f:
         return json.load(f)
 
 
 @router.get("/train/result")
-async def get_last_train_result(current_user=Depends(get_current_active_user)):
+async def get_last_train_result(
+    asset_class: str = "equities",
+    current_user=Depends(get_current_active_user),
+):
     import os
     import json
+    from app.ml.models.registry import _paths_for, _normalize_asset_class
 
-    path = "checkpoints/last_train_result.json"
+    ac = _normalize_asset_class(asset_class)
+    path = os.path.join(_paths_for(ac)["dir"], "last_train_result.json")
     if not os.path.exists(path):
-        raise HTTPException(404, "No training result found yet.")
+        raise HTTPException(404, f"No training result for {ac} yet.")
     with open(path) as f:
         return json.load(f)
 

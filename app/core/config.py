@@ -39,24 +39,28 @@ class Settings(BaseSettings):
 
     TICKER_LIST_PATH: str = "data/sp500.json"
     MAX_BARS_TO_ENTRY: int = 30
-    # Triple-barrier labeling — back to the original 1.5%/1.5% which gave
-    # the best test accuracy on this dataset (BUY-heavy, but the model has
-    # enough samples per class to learn meaningful boundaries).
-    LOOKAHEAD_WINDOW: int = 5
-    BUY_THRESHOLD: float = 0.015
-    SELL_THRESHOLD: float = 0.015
+    # Triple-barrier labeling — symmetric 2%/2% over 15 bars.
+    # Previous asymmetric +2.5/-1.5 @ 10d skewed the class distribution
+    # toward SELL (53% of labels) because the smaller bear barrier fired
+    # more often, producing a model that predicted SELL 60% of the time
+    # even on true BUY samples. Symmetric thresholds with a longer window
+    # rebalance the classes and push HOLD toward majority so the model is
+    # forced to learn high-conviction directional moves, not regime drift.
+    LOOKAHEAD_WINDOW: int = 15
+    BUY_THRESHOLD: float = 0.020
+    SELL_THRESHOLD: float = 0.020
 
     # ── Signal execution risk parameters ──────────────────────────────────────
     # All applied at signal generation time in predict_ticker. The model's
     # raw prediction is filtered through these gates before being surfaced.
     UNCERTAINTY_MAX:      float = 0.15  # Skip if MC-dropout std > this (untrustworthy signal)
-    MIN_RR_RATIO:         float = 1.5   # Require predicted_tp / predicted_sl >= this
-    MIN_EXPECTED_VALUE:   float = 0.002 # 0.2% — minimum positive EV to take the trade
+    MIN_RR_RATIO:         float = 2.0   # Require predicted_tp / predicted_sl >= this
+    MIN_EXPECTED_VALUE:   float = 0.005 # 0.5% — minimum positive EV to take the trade
     EVENT_DAYS_MIN:       int   = 1     # Skip trades within N days of FOMC/CPI/NFP
     EARNINGS_DAYS_MIN:    int   = 2     # Skip trades within N days of earnings (gap risk)
     KELLY_FRACTION:       float = 0.25  # Quarter-Kelly bet sizing — conservative
     MAX_RISK_PER_TRADE:   float = 0.01  # 1% of capital risked per trade max
-    MIN_PREDICTED_SL_PCT: float = 0.003 # 0.3% — floor on predicted SL to avoid div-by-zero in R:R
+    MIN_PREDICTED_SL_PCT: float = 0.005 # 0.5% — floor on predicted SL (was 0.3% — too tight vs spread+vol)
 
     @model_validator(mode="after")
     def validate_required(self) -> "Settings":

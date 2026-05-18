@@ -5,7 +5,10 @@ logger = logging.getLogger(__name__)
 
 BUCKET = "ml_checkpoints"
 
-# Files that must survive a server restart
+# Files that must survive a server restart. The post-FX layout namespaces
+# checkpoints under per-asset-class subfolders (`equities/`, `fx/`); legacy
+# pre-FX deploys stored these flat at the bucket root. Sync logic handles
+# both layouts so old cloud state still bootstraps onto a fresh disk.
 CHECKPOINT_FILES = [
     "best_model.pt",
     "model_config.json",
@@ -13,6 +16,8 @@ CHECKPOINT_FILES = [
     "eval_report.json",
     "versions.json",
 ]
+
+ASSET_CLASS_SUBFOLDERS = ("equities", "fx")
 
 
 def _client():
@@ -66,17 +71,36 @@ def download(filename: str, local_path: str) -> bool:
 
 
 def sync_from_cloud():
-    """Download any checkpoint files missing locally — called at startup."""
-    logger.info("☁️  Syncing checkpoints from Supabase Storage...")
+    """Download any checkpoint files missing locally — called at startup.
+
+    Tries the per-asset-class layout (`equities/best_model.pt`, etc.) first;
+    if a file is also missing under that path, falls back to the legacy flat
+    layout (`best_model.pt` at the bucket root) and writes it into the
+    equities subfolder locally. This preserves any pre-FX cloud state from
+    older deploys.
+    """
+    logger.info("Syncing checkpoints from Supabase Storage...")
     os.makedirs("checkpoints", exist_ok=True)
-    for filename in CHECKPOINT_FILES:
-        local_path = os.path.join("checkpoints", filename)
-        if not os.path.exists(local_path):
-            download(filename, local_path)
+
+    for ac in ASSET_CLASS_SUBFOLDERS:
+        local_dir = os.path.join("checkpoints", ac)
+        os.makedirs(local_dir, exist_ok=True)
+        for filename in CHECKPOINT_FILES:
+            local_path = os.path.join(local_dir, filename)
+            if os.path.exists(local_path):
+                continue
+            # Try per-asset-class cloud path first.
+            if download(f"{ac}/{filename}", local_path):
+                continue
+            # Legacy flat fallback only for equities — there was no FX before.
+            if ac == "equities":
+                download(filename, local_path)
 
 
-def upload_all():
-    """Upload all checkpoint files to Supabase Storage — called after training."""
+def upload_all(asset_class: str = "equities"):
+    """Upload all checkpoint files for a given asset class — called after training."""
+    if asset_class not in ASSET_CLASS_SUBFOLDERS:
+        raise ValueError(f"asset_class must be one of {ASSET_CLASS_SUBFOLDERS}")
     for filename in CHECKPOINT_FILES:
-        local_path = os.path.join("checkpoints", filename)
-        upload(filename, local_path)
+        local_path = os.path.join("checkpoints", asset_class, filename)
+        upload(f"{asset_class}/{filename}", local_path)

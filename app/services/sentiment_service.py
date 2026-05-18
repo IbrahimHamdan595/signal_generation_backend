@@ -6,6 +6,7 @@ import logging
 
 from app.services.news_service import NewsService, AlphaVantageNewsService, FinnhubNewsService, EdgarNewsService
 from app.services.finbert_service import FinBERTService
+from app.core.asset_class import is_fx
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,16 @@ class SentimentService:
         for i, ticker in enumerate(tickers):
             try:
                 t = ticker.upper()
+                # FX/metal pairs don't have per-pair news coverage in any of
+                # the configured sources (Finnhub company-news, EDGAR filings,
+                # Alpha Vantage equity news). Skip them entirely — the
+                # dataset builder falls back to zero-vectors when
+                # daily_sentiment has no rows for a ticker.
+                if is_fx(t):
+                    success.append(t)
+                    if progress_cb is not None:
+                        progress_cb(i + 1, n, t)
+                    continue
                 if recent_limit is not None:
                     count = await self._ingest_recent(t, recent_limit)
                 else:

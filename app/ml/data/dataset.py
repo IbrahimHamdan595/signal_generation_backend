@@ -5,6 +5,7 @@ import asyncpg
 import logging
 
 from app.core.config import settings
+from app.core.asset_class import is_fx
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +94,38 @@ INDICATOR_COLS = [c for c in DB_INDICATOR_COLS if c not in _DROPPED_FEATURES] + 
 
 SENTIMENT_COLS = ["avg_positive", "avg_negative", "avg_neutral", "avg_compound"]
 
+# FX-only feature additions appended to the per-bar feature row when the
+# ticker is an FX/metal pair, left out for equities (which keep n_features=51).
+#
+# Two groups:
+#   GLOBAL  — same value for all FX pairs on the same date; sourced from
+#             fx_macro_features (refreshed daily by the scheduler).
+#   PER_PAIR — computed per-bar per-pair inside _build_ticker from OHLCV.
+FX_MACRO_COLS         = ["dxy_ret_5d", "vix_close", "yield_spread_10_2", "us_2y_yield"]
+FX_PER_PAIR_VOL_COLS  = ["realized_vol_20d", "vol_of_vol_5d"]
+
+# Multi-timeframe: most-recent-4h indicator snapshot joined to each daily bar.
+# Sourced from `indicators` table where interval='4h' (backfilled by
+# scripts/backfill_fx_4h.py for the last ~2 years per pair).
+#
+# Experimentally, naively appending these 4 features to a daily-context model
+# REGRESSED test Sharpe (0.29 → 0.19) — likely because the simple "append" loses
+# the sequence structure that MTF needs. The columns are still computed by the
+# dataset builder (the join runs harmlessly) but are NOT in FEATURE_COLS_FX, so
+# the model doesn't see them. To re-enable, append `+ FX_4H_COLS` below.
+FX_4H_COLS = ["rsi_14_4h", "macd_hist_4h", "atr_14_4h", "roc_5_4h"]
+
+# Base feature column list used for equity samples (n_features = 51).
 FEATURE_COLS = OHLCV_COLS + INDICATOR_COLS
+
+# FX feature column list adds 4 macro globals + 2 per-pair vol features at the
+# end (n_features = 57). Equities stays at 51.
+FEATURE_COLS_FX = FEATURE_COLS + FX_MACRO_COLS + FX_PER_PAIR_VOL_COLS
+
+
+def feature_cols_for(ticker: str) -> list[str]:
+    """Return the feature column list appropriate for `ticker`'s asset class."""
+    return FEATURE_COLS_FX if is_fx(ticker) else FEATURE_COLS
 
 SEQUENCE_LEN = 60
 
@@ -204,7 +236,30 @@ class DatasetBuilder:
         )
         return X_price, X_sentiment, y_class, y_regression, y_timing_out, scaler_params
 
-    async def _build_ticker(self, ticker: str, interval: str, sequence_len: int):
+    async def _build_ticker(
+        self,
+        ticker: str,
+        interval: str,
+        sequence_len: int,
+        buy_thresh: Optional[float] = None,
+        sell_thresh: Optional[float] = None,
+        lookahead: Optional[int] = None,
+        barrier_atr_mult: Optional[float] = None,
+    ):
+        """Build a single ticker's training arrays.
+
+        `buy_thresh` / `sell_thresh` / `lookahead` override `settings` for
+        this build only — used by per-asset-class training (FX needs smaller
+        barriers + longer lookahead than the equity defaults).
+
+        `barrier_atr_mult` activates volatility-normalised labelling: when
+        set, the triple-barrier thresholds become `barrier_atr_mult × ATR(t) / close(t)`
+        per bar instead of the fixed `buy_thresh` / `sell_thresh`. This makes
+        label density consistent across pairs with very different volatility
+        profiles (EURUSD ~0.5% ATR vs XAUUSD ~$30/oz ≈ 1.5%) — the textbook
+        FX-ML fix. `buy_thresh`/`sell_thresh` then serve only as a fallback
+        floor for bars where ATR is missing/zero.
+        """
         async with self.pool.acquire() as conn:
             ohlcv_rows = await conn.fetch(
                 """
@@ -274,6 +329,105 @@ class DatasetBuilder:
             for col in DB_INDICATOR_COLS:
                 df[col] = np.nan
 
+        # ── FX-only global macro features ───────────────────────────────────
+        # Left-join fx_macro_features on bar date so the model sees DXY 5d
+        # return, VIX level, and yield-curve spread alongside the per-pair
+        # indicators. Equity samples skip this join — their checkpoint is
+        # trained on 51 features, not 54.
+        ticker_is_fx = is_fx(ticker)
+        if ticker_is_fx:
+            async with self.pool.acquire() as conn:
+                macro_rows = await conn.fetch(
+                    """
+                    SELECT date, dxy_ret_5d, vix_close, yield_spread_10_2, us_2y_yield
+                    FROM fx_macro_features
+                    ORDER BY date ASC
+                    """
+                )
+            if macro_rows:
+                df_macro = pd.DataFrame([dict(r) for r in macro_rows])
+                # Normalise both join keys to tz-naive datetime64[ns] at
+                # midnight so pandas accepts the merge — OHLCV timestamps
+                # arrive from asyncpg as datetime64[us, UTC] while macro
+                # dates come in as datetime64[s] without tz, which raises
+                # "you are trying to merge on different dtypes" otherwise.
+                df_macro["date"] = (
+                    pd.to_datetime(df_macro["date"])
+                    .dt.tz_localize(None)
+                    .astype("datetime64[ns]")
+                )
+                ts_naive = pd.to_datetime(df["timestamp"])
+                if getattr(ts_naive.dt, "tz", None) is not None:
+                    ts_naive = ts_naive.dt.tz_localize(None)
+                df["__date"] = ts_naive.dt.normalize().astype("datetime64[ns]")
+                df = df.merge(df_macro, left_on="__date", right_on="date", how="left")
+                df = df.drop(columns=["__date", "date"])
+            else:
+                # Macro table empty (backfill not run yet) — zero-fill so
+                # training still produces a clean feature vector of the right
+                # width.
+                logger.warning(f"⚠️  {ticker}: fx_macro_features is empty — zero-filling macros")
+                for col in FX_MACRO_COLS:
+                    df[col] = 0.0
+
+            # ── Per-pair realized-volatility features ────────────────────────
+            # std of log returns over a 20-bar window, plus the 5-bar std of
+            # that series (vol-of-vol). Captures volatility regime / regime
+            # change — both well-documented FX persistence signals.
+            log_ret = np.log(df["close"].astype(float) / df["close"].astype(float).shift(1))
+            df["realized_vol_20d"] = log_ret.rolling(20, min_periods=5).std().fillna(0.0)
+            df["vol_of_vol_5d"]    = df["realized_vol_20d"].rolling(5, min_periods=2).std().fillna(0.0)
+
+            # ── 4h multi-timeframe features ──────────────────────────────────
+            # For each daily bar at timestamp T, snap to the most-recent 4h
+            # indicator row at or before T. yfinance only gives ~2 years of 4h
+            # history, so older daily samples will have NaNs here — they get
+            # zero-padded by the model's nan_to_num path, equivalent to "no
+            # MTF context".
+            async with self.pool.acquire() as conn:
+                rows_4h = await conn.fetch(
+                    """
+                    SELECT timestamp, rsi_14, macd_histogram, atr_14, roc_5
+                    FROM indicators
+                    WHERE ticker = $1 AND interval = '4h'
+                    ORDER BY timestamp ASC
+                    """,
+                    ticker,
+                )
+            if rows_4h:
+                df_4h = pd.DataFrame([dict(r) for r in rows_4h]).rename(columns={
+                    "rsi_14":          "rsi_14_4h",
+                    "macd_histogram":  "macd_hist_4h",
+                    "atr_14":          "atr_14_4h",
+                    "roc_5":           "roc_5_4h",
+                })
+                # Normalise timestamps to tz-naive ns so merge_asof accepts
+                # both sides (mirrors the macro-feature merge fix earlier).
+                ts_4h = pd.to_datetime(df_4h["timestamp"])
+                if getattr(ts_4h.dt, "tz", None) is not None:
+                    ts_4h = ts_4h.dt.tz_localize(None)
+                df_4h["timestamp"] = ts_4h.astype("datetime64[ns]")
+                df_4h = df_4h.sort_values("timestamp").reset_index(drop=True)
+
+                ts_day = pd.to_datetime(df["timestamp"])
+                if getattr(ts_day.dt, "tz", None) is not None:
+                    ts_day = ts_day.dt.tz_localize(None)
+                df["timestamp"] = ts_day.astype("datetime64[ns]")
+                df = df.sort_values("timestamp").reset_index(drop=True)
+
+                # Backward merge_asof: for each daily ts, take the latest 4h
+                # row with ts <= daily ts. Direction='backward' is the default.
+                df = pd.merge_asof(
+                    df, df_4h,
+                    on="timestamp",
+                    direction="backward",
+                    allow_exact_matches=True,
+                )
+            else:
+                logger.warning(f"⚠️  {ticker}: no 4h indicators yet — zero-filling MTF cols")
+                for col in FX_4H_COLS:
+                    df[col] = 0.0
+
         df = df.sort_values("timestamp").reset_index(drop=True)
 
         # Cyclical encoding: integer time features → (sin, cos) pairs so the
@@ -289,7 +443,9 @@ class DatasetBuilder:
         df["month_sin"] = np.sin(2 * np.pi * mon / 12.0)
         df["month_cos"] = np.cos(2 * np.pi * mon / 12.0)
 
-        df[FEATURE_COLS] = df[FEATURE_COLS].ffill().bfill()
+        # Use the asset-class-appropriate feature column list — FX adds 3 macros.
+        feat_cols = FEATURE_COLS_FX if ticker_is_fx else FEATURE_COLS
+        df[feat_cols] = df[feat_cols].ffill().bfill()
 
         # ── Build per-bar sentiment lookup ────────────────────────────────────
         # Priority:
@@ -356,15 +512,28 @@ class DatasetBuilder:
         else:
             daily_sent_filled = {}
 
-        prices     = df[FEATURE_COLS].values
+        prices     = df[feat_cols].values
         closes     = df["close"].values
         timestamps = df["timestamp"].values
 
+        # ATR series — used by the volatility-normalised labelling branch.
+        # When `barrier_atr_mult` is set, each bar's threshold becomes
+        # `mult × atr(t) / close(t)`. This is the textbook fix for label
+        # density inconsistency across pairs with different daily volatility.
+        atr_series = df["atr_14"].astype(float).values if "atr_14" in df.columns else None
+
         X_price, X_sent, y_cls, y_reg, y_timing = [], [], [], [], []
 
-        lookahead   = settings.LOOKAHEAD_WINDOW
-        buy_thresh  = settings.BUY_THRESHOLD
-        sell_thresh = settings.SELL_THRESHOLD
+        # Per-build overrides (asset-class-specific thresholds) win over
+        # the global settings defaults.
+        lookahead   = lookahead   if lookahead   is not None else settings.LOOKAHEAD_WINDOW
+        buy_thresh  = buy_thresh  if buy_thresh  is not None else settings.BUY_THRESHOLD
+        sell_thresh = sell_thresh if sell_thresh is not None else settings.SELL_THRESHOLD
+
+        # Floor for ATR-normalised thresholds — prevents pegged pairs
+        # (USDHKD-like) with near-zero ATR from getting a 0% barrier that
+        # fires on every bar.
+        _BARRIER_FLOOR = 0.003
 
         # Leave enough future bars for the lookahead window
         for i in range(sequence_len, len(df) - lookahead):
@@ -393,40 +562,57 @@ class DatasetBuilder:
                 [bar_pos, bar_neg, bar_neu, bar_compound], dtype=np.float32
             )
 
-            # ── Fix 1: Triple-barrier labeling ───────────────────────────────
-            # Walk forward bar-by-bar; assign label at first barrier touched.
-            # BUY  barrier: close rises   ≥ buy_thresh  (default +2%)
-            # SELL barrier: close falls   ≥ sell_thresh (default -1%)
-            # HOLD: neither barrier touched within lookahead window.
-            # Asymmetric thresholds encode a 2:1 reward-to-risk expectation.
+            # ── Triple-barrier labeling ──────────────────────────────────────
+            # Volatility-normalised when `barrier_atr_mult` is provided:
+            # threshold(t) = mult × atr(t) / close(t), bounded below by the
+            # floor to avoid 0% barriers on pegged pairs. Otherwise falls
+            # back to the fixed buy_thresh / sell_thresh per-build overrides.
+            if barrier_atr_mult is not None and atr_series is not None:
+                atr_t = float(atr_series[i]) if not np.isnan(atr_series[i]) else 0.0
+                if atr_t > 0 and current_close > 0:
+                    bar_buy_thresh  = max(barrier_atr_mult * atr_t / current_close, _BARRIER_FLOOR)
+                    bar_sell_thresh = bar_buy_thresh   # symmetric
+                else:
+                    bar_buy_thresh  = buy_thresh
+                    bar_sell_thresh = sell_thresh
+            else:
+                bar_buy_thresh  = buy_thresh
+                bar_sell_thresh = sell_thresh
+
             future_closes = closes[i + 1 : i + 1 + lookahead]
             label = 0  # HOLD default
-            for fc in future_closes:
+            hit_idx = len(future_closes) - 1  # full window if no barrier
+            for j, fc in enumerate(future_closes):
                 ret = (fc - current_close) / current_close
-                if ret >= buy_thresh:
+                if ret >= bar_buy_thresh:
                     label = 1   # BUY — upper barrier hit first
+                    hit_idx = j
                     break
-                if ret <= -sell_thresh:
+                if ret <= -bar_sell_thresh:
                     label = 2   # SELL — lower barrier hit first
+                    hit_idx = j
                     break
 
             # ── Regression targets — all as % deviations from current close ──
-            # All price-level targets stored as decimal % so gradients stay in
-            # the same range as classification loss. Multiply by current_close
-            # at inference to recover dollar values.
+            # Truncate at the barrier-hit index so the regression head learns
+            # SL/TP magnitudes consistent with the trade window the classifier
+            # actually identified — not post-exit excursions that bloat the
+            # noise in sl_pct labels.
             entry = current_close
             if entry <= 0:
                 continue
 
+            trade_window = future_closes[: hit_idx + 1] if len(future_closes) > 0 else future_closes
+
             if label == 1:  # BUY
-                tp_abs  = float(np.max(future_closes)) if len(future_closes) > 0 else entry * (1 + buy_thresh)
-                sl_abs  = float(np.min(future_closes)) if len(future_closes) > 0 else entry * (1 - sell_thresh)
+                tp_abs  = float(np.max(trade_window)) if len(trade_window) > 0 else entry * (1 + buy_thresh)
+                sl_abs  = float(np.min(trade_window)) if len(trade_window) > 0 else entry * (1 - sell_thresh)
                 tp_pct  = (tp_abs - entry) / entry
                 sl_pct  = (sl_abs - entry) / entry
                 net_pct = tp_pct + sl_pct
             elif label == 2:  # SELL
-                tp_abs  = float(np.min(future_closes)) if len(future_closes) > 0 else entry * (1 - sell_thresh)
-                sl_abs  = float(np.max(future_closes)) if len(future_closes) > 0 else entry * (1 + buy_thresh)
+                tp_abs  = float(np.min(trade_window)) if len(trade_window) > 0 else entry * (1 - sell_thresh)
+                sl_abs  = float(np.max(trade_window)) if len(trade_window) > 0 else entry * (1 + buy_thresh)
                 tp_pct  = (entry - tp_abs) / entry
                 sl_pct  = (entry - sl_abs) / entry
                 net_pct = tp_pct + sl_pct

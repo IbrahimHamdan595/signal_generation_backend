@@ -38,7 +38,7 @@ class SignalResponse(BaseModel):
     nfp_days:      Optional[float] = None
     earnings_days: Optional[float] = None
 
-    source: str = "ml_model"
+    source: str = "ml_equities"
     created_at: datetime
 
 

@@ -1,0 +1,32 @@
+{
+  "_meta": {
+    "schema_version": 1,
+    "description": "FX and precious-metal pairs trained against the FX model. mt5_symbol is the canonical ticker stored in ohlcv_data/signals. yfinance_symbol gives the historical-backfill source; null = MT5-only (no yfinance coverage).",
+    "asset_classes": {
+      "fx_major": "Currency pair (including crosses without USD)",
+      "fx_metal": "Precious metal quoted in dollars (spot or front-month futures proxy)"
+    }
+  },
+  "pairs": [
+    {"mt5_symbol": "EURUSD", "yfinance_symbol": "EURUSD=X", "asset_class": "fx_major", "name": "Euro / US Dollar"},
+    {"mt5_symbol": "USDJPY", "yfinance_symbol": "USDJPY=X", "asset_class": "fx_major", "name": "US Dollar / Japanese Yen"},
+    {"mt5_symbol": "GBPUSD", "yfinance_symbol": "GBPUSD=X", "asset_class": "fx_major", "name": "British Pound / US Dollar"},
+    {"mt5_symbol": "USDCNH", "yfinance_symbol": null,        "asset_class": "fx_major", "name": "US Dollar / Offshore Chinese Yuan (MT5 only — yfinance lacks history)"},
+    {"mt5_symbol": "USDCAD", "yfinance_symbol": "USDCAD=X", "asset_class": "fx_major", "name": "US Dollar / Canadian Dollar"},
+    {"mt5_symbol": "AUDUSD", "yfinance_symbol": "AUDUSD=X", "asset_class": "fx_major", "name": "Australian Dollar / US Dollar"},
+    {"mt5_symbol": "USDCHF", "yfinance_symbol": "USDCHF=X", "asset_class": "fx_major", "name": "US Dollar / Swiss Franc"},
+    {"mt5_symbol": "NZDUSD", "yfinance_symbol": "NZDUSD=X", "asset_class": "fx_major", "name": "New Zealand Dollar / US Dollar"},
+    {"mt5_symbol": "USDHKD", "yfinance_symbol": "USDHKD=X", "asset_class": "fx_major", "name": "US Dollar / Hong Kong Dollar"},
+    {"mt5_symbol": "USDSGD", "yfinance_symbol": "USDSGD=X", "asset_class": "fx_major", "name": "US Dollar / Singapore Dollar"},
+    {"mt5_symbol": "XAUUSD", "yfinance_symbol": "GC=F",     "asset_class": "fx_metal", "name": "Gold / US Dollar (front-month futures proxy)"},
+    {"mt5_symbol": "XAGUSD", "yfinance_symbol": "SI=F",     "asset_class": "fx_metal", "name": "Silver / US Dollar (front-month futures proxy)"},
+    {"mt5_symbol": "XAUEUR", "yfinance_symbol": null,        "asset_class": "fx_metal", "name": "Gold / Euro (MT5 only — no yfinance feed)"},
+    {"mt5_symbol": "XAUAUD", "yfinance_symbol": null,        "asset_class": "fx_metal", "name": "Gold / Australian Dollar (MT5 only — no yfinance feed)"},
+    {"mt5_symbol": "XPTUSD", "yfinance_symbol": "PL=F",     "asset_class": "fx_metal", "name": "Platinum / US Dollar (front-month futures proxy)"},
+    {"mt5_symbol": "XPDUSD", "yfinance_symbol": "PA=F",     "asset_class": "fx_metal", "name": "Palladium / US Dollar (front-month futures proxy)"},
+    {"mt5_symbol": "EURJPY", "yfinance_symbol": "EURJPY=X", "asset_class": "fx_major", "name": "Euro / Japanese Yen"},
+    {"mt5_symbol": "EURGBP", "yfinance_symbol": "EURGBP=X", "asset_class": "fx_major", "name": "Euro / British Pound"},
+    {"mt5_symbol": "GBPJPY", "yfinance_symbol": "GBPJPY=X", "asset_class": "fx_major", "name": "British Pound / Japanese Yen"},
+    {"mt5_symbol": "AUDJPY", "yfinance_symbol": "AUDJPY=X", "asset_class": "fx_major", "name": "Australian Dollar / Japanese Yen"}
+  ]
+}

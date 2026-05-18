@@ -7,6 +7,7 @@ from slowapi.errors import RateLimitExceeded
 import logging
 
 from app.core.config import settings
+from app.core.asset_class import fx_pair_count   # import fails fast if fx_majors.json is malformed
 from app.db.database import connect_db, close_db
 from app.api.router import api_router
 from app.ml.models.registry import load_model
@@ -24,10 +25,15 @@ limiter = Limiter(key_func=get_remote_address)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info(f"Starting {settings.APP_NAME} v{settings.APP_VERSION}")
+    logger.info(f"FX registry loaded: {fx_pair_count()} pairs")
     await connect_db()
     from app.services.storage_service import sync_from_cloud
     sync_from_cloud()
-    load_model()
+    # Eagerly load both per-asset-class models so the first request doesn't
+    # pay the disk-read latency. Either may be absent (untrained) — `load_model`
+    # handles missing files gracefully.
+    load_model("equities")
+    load_model("fx")
     start_scheduler()
     yield
     stop_scheduler()
@@ -72,10 +78,51 @@ async def root():
 
 @app.get("/health", tags=["Health"])
 async def health():
-    from app.ml.models.registry import is_model_trained
+    """Per-pipeline operational health.
 
-    return {
-        "status": "ok",
-        "model_trained": is_model_trained(),
-        "scheduler": "running",
-    }
+    Returns enabled flag, training status, last-run timestamp, last error,
+    and last-signals-count for each of the three pipelines. External
+    monitors (uptime checks, dashboards) get a single endpoint that
+    reflects the whole multi-pipeline system's state.
+    """
+    from app.ml.models.registry import is_model_trained
+    from app.db.database import get_db
+    from app.api.routes.pipelines import get_enabled_sources
+
+    out = {"status": "ok", "scheduler": "running", "pipelines": {}}
+
+    # Per-pipeline section — degrades gracefully if the DB is unreachable
+    try:
+        pool = await get_db()
+        enabled = await get_enabled_sources(pool)
+        async with pool.acquire() as conn:
+            cfg_rows = await conn.fetch(
+                "SELECT source, enabled, last_run_at, last_signals_count, last_error "
+                "FROM pipeline_config ORDER BY source"
+            )
+        for r in cfg_rows:
+            src = r["source"]
+            if src == "ml_equities":
+                trained = is_model_trained("equities")
+            elif src == "ml_fx":
+                trained = is_model_trained("fx")
+            else:   # rule_donchian — no training step
+                trained = True
+            out["pipelines"][src] = {
+                "enabled":            src in enabled,
+                "trained":            trained,
+                "last_run_at":        r["last_run_at"].isoformat() if r["last_run_at"] else None,
+                "last_signals_count": r["last_signals_count"],
+                "last_error":         r["last_error"],
+            }
+    except Exception as e:
+        out["status"] = "degraded"
+        out["error"]  = f"pipeline_config unreachable: {type(e).__name__}: {e}"
+
+    # Legacy field kept for backwards-compat with anything still consuming the
+    # old /health shape — `True` iff *any* ML pipeline has a trained checkpoint.
+    out["model_trained"] = bool(
+        out["pipelines"].get("ml_equities", {}).get("trained")
+        or out["pipelines"].get("ml_fx", {}).get("trained")
+    )
+    return out

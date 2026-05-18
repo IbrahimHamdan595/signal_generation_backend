@@ -10,6 +10,7 @@ from typing import Dict, List, Tuple, Optional
 import logging
 
 from app.core.config import settings
+from app.core.asset_class import is_fx, yfinance_symbol_for
 from app.services.macro_event_service import days_to_next_event
 
 # ── Module-level caches (shared across all OHLCVService instances) ────────────
@@ -22,8 +23,8 @@ _MACRO_EVENTS_CACHE: Optional[tuple[dict, date]] = None
 
 logger = logging.getLogger(__name__)
 
-VALID_INTERVALS = {"1d", "1h", "5m", "15m", "30m"}
-VALID_PERIODS = {"1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y"}
+VALID_INTERVALS = {"1d", "4h", "1h", "5m", "15m", "30m"}
+VALID_PERIODS = {"1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "730d", "max"}
 
 
 class OHLCVService:
@@ -81,62 +82,113 @@ class OHLCVService:
     ) -> int:
         """
         start_date: if provided, fetch only bars on/after this date (incremental).
-        Returns 0 (not an error) when start_date is given and yfinance has nothing new.
+        Returns 0 (not an error) when the source has nothing new.
+
+        Data source dispatcher:
+        - equity tickers → yfinance (existing path)
+        - FX tickers with a yfinance mapping (e.g. EURUSD → EURUSD=X) →
+          yfinance using the mapped symbol, stored under the canonical mt5 name
+        - FX tickers without a yfinance mapping (e.g. XAUEUR) → MT5 copy_rates
         """
         loop = asyncio.get_event_loop()
-        max_retries = 3
         df = None
 
+        # Resolve the source-specific symbol for the data fetch. The canonical
+        # `ticker` is what gets stored in the DB regardless of source.
         _t = ticker
         _i = interval
         _p = period
         _sd = start_date
 
-        for attempt in range(max_retries):
-            try:
-                df = await loop.run_in_executor(
-                    None,
-                    lambda: yf.download(
-                        _t,
-                        # incremental: use start/end; full: use period
-                        **({"start": _sd, "end": date.today()} if _sd else {"period": _p}),
-                        interval=_i,
-                        progress=False,
-                        auto_adjust=True,
-                        actions=False,
-                        threads=False,
-                    ),
+        use_mt5 = False
+        if is_fx(ticker):
+            yf_sym = yfinance_symbol_for(ticker)
+            if yf_sym:
+                _t = yf_sym  # e.g. EURUSD → EURUSD=X
+                logger.info(f"📈 FX ingest: {ticker} via yfinance({yf_sym})")
+            else:
+                use_mt5 = True
+                logger.info(f"📈 FX ingest: {ticker} via MT5 copy_rates")
+
+        if use_mt5:
+            # ── MT5 branch ───────────────────────────────────────────────────
+            from app.services.broker_service import BrokerService
+
+            if _sd is not None:
+                mt5_start = _sd
+            else:
+                # Period strings → days back from today (matches yfinance keys).
+                period_days = {
+                    "1d": 1, "5d": 5, "1mo": 31, "3mo": 93,
+                    "6mo": 186, "1y": 366, "2y": 732, "5y": 1830,
+                    "10y": 3660, "max": 7320,   # MT5 brokers rarely have > 5-10y daily history anyway
+                }.get(_p, 366)
+                mt5_start = (
+                    pd.Timestamp.today().normalize().date()
+                    - pd.Timedelta(days=period_days)
                 )
 
-                if df is not None and not df.empty:
-                    logger.info(f"✅ Successfully fetched {ticker} (attempt {attempt + 1})")
-                    break
-                else:
-                    if _sd:
-                        # Empty is normal for incremental — no new bars since last ingest
-                        logger.info(f"⏭️  {ticker}: no new bars since {_sd} — skipping")
-                        return 0
-                    wait_time = 10 * (attempt + 1)
-                    logger.warning(
-                        f"⚠️ Empty response for {ticker}, attempt {attempt + 1}/{max_retries} "
-                        f"— retrying in {wait_time}s"
+            broker = BrokerService()
+            try:
+                df = await broker.get_bars(ticker, _i, mt5_start)
+            except RuntimeError as e:
+                raise ValueError(f"MT5 fetch failed for {ticker}: {e}")
+
+            if df is None or df.empty:
+                if _sd:
+                    logger.info(f"⏭️  {ticker}: no new MT5 bars since {_sd} — skipping")
+                    return 0
+                raise ValueError(f"MT5 returned no bars for {ticker} (period={_p})")
+
+            logger.info(f"✅ Successfully fetched {ticker} via MT5 ({len(df)} bars)")
+        else:
+            # ── yfinance branch (retry loop) ──────────────────────────────────
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    df = await loop.run_in_executor(
+                        None,
+                        lambda: yf.download(
+                            _t,
+                            # incremental: use start/end; full: use period
+                            **({"start": _sd, "end": date.today()} if _sd else {"period": _p}),
+                            interval=_i,
+                            progress=False,
+                            auto_adjust=True,
+                            actions=False,
+                            threads=False,
+                        ),
                     )
+
+                    if df is not None and not df.empty:
+                        logger.info(f"✅ Successfully fetched {ticker} (attempt {attempt + 1})")
+                        break
+                    else:
+                        if _sd:
+                            # Empty is normal for incremental — no new bars since last ingest
+                            logger.info(f"⏭️  {ticker}: no new bars since {_sd} — skipping")
+                            return 0
+                        wait_time = 10 * (attempt + 1)
+                        logger.warning(
+                            f"⚠️ Empty response for {ticker}, attempt {attempt + 1}/{max_retries} "
+                            f"— retrying in {wait_time}s"
+                        )
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(wait_time)
+
+                except Exception as e:
+                    logger.warning(f"⚠️ Attempt {attempt + 1} failed for {ticker}: {str(e)}")
                     if attempt < max_retries - 1:
+                        wait_time = 5 * (attempt + 1)
+                        logger.info(f"⏳ Retrying {ticker} in {wait_time}s...")
                         await asyncio.sleep(wait_time)
 
-            except Exception as e:
-                logger.warning(f"⚠️ Attempt {attempt + 1} failed for {ticker}: {str(e)}")
-                if attempt < max_retries - 1:
-                    wait_time = 5 * (attempt + 1)
-                    logger.info(f"⏳ Retrying {ticker} in {wait_time}s...")
-                    await asyncio.sleep(wait_time)
-
-        if df is None or df.empty:
-            if start_date:
-                return 0  # incremental with no new data is not an error
-            raise ValueError(
-                f"No data returned for {ticker} after {max_retries} attempts"
-            )
+            if df is None or df.empty:
+                if start_date:
+                    return 0  # incremental with no new data is not an error
+                raise ValueError(
+                    f"No data returned for {ticker} after {max_retries} attempts"
+                )
 
         df = df.reset_index()
 
@@ -227,7 +279,8 @@ class OHLCVService:
         indicators_df = await loop.run_in_executor(
             None,
             lambda: self._compute_indicators(
-                df, vix_series, earnings_dates, putcall_series, macro_events, eps_history
+                df, vix_series, earnings_dates, putcall_series, macro_events, eps_history,
+                ticker=ticker,
             ),
         )
 
@@ -390,6 +443,11 @@ class OHLCVService:
 
     def _fetch_earnings_dates(self, ticker: str) -> pd.DatetimeIndex:
         """Return normalised tz-naive DatetimeIndex of all known earnings dates for ticker."""
+        # FX/metal pairs have no corporate earnings — return empty so the
+        # downstream indicator pipeline assigns a neutral earnings_days
+        # value and skips the yfinance lookup entirely.
+        if is_fx(ticker):
+            return pd.DatetimeIndex([])
         try:
             t = yf.Ticker(ticker)
             ed = t.earnings_dates
@@ -466,8 +524,11 @@ class OHLCVService:
     async def _fetch_and_store_eps_surprises(self, ticker: str) -> Dict[str, float]:
         """Fetch EPS surprises from Finnhub, store in earnings_history, return {date_str: pct}.
 
-        Returns an empty dict when FINNHUB_API_KEY is unset or the request fails.
+        Returns an empty dict when FINNHUB_API_KEY is unset, ticker is FX (no
+        corporate earnings exist), or the request fails.
         """
+        if is_fx(ticker):
+            return {}
         api_key = settings.FINNHUB_API_KEY
         if not api_key:
             return {}
@@ -543,6 +604,7 @@ class OHLCVService:
         putcall_series: pd.Series = None,
         macro_events: Optional[Dict[str, List[str]]] = None,
         eps_history: Optional[Dict[str, float]] = None,
+        ticker: Optional[str] = None,
     ) -> pd.DataFrame:
         out = df[["timestamp"]].copy()
         close = df["close"]
@@ -640,6 +702,9 @@ class OHLCVService:
             out["vix_change"] = 0.0
 
         # ── Days to next earnings ─────────────────────────────────────────────
+        # FX tickers have no corporate earnings → 90 (neutral, well beyond
+        # EARNINGS_DAYS_MIN). Equity tickers with no fetched dates → 30
+        # (legacy default, preserved for backward-compat with prior models).
         if earnings_dates is not None and len(earnings_dates) > 0:
             def _days_to_next(dt: pd.Timestamp) -> int:
                 future = earnings_dates[earnings_dates >= dt]
@@ -648,7 +713,7 @@ class OHLCVService:
                 return int((future[0] - dt).days)
             out["earnings_days"] = bar_dates.apply(_days_to_next).values
         else:
-            out["earnings_days"] = 30
+            out["earnings_days"] = 90 if (ticker and is_fx(ticker)) else 30
 
         # social_sentiment is populated later by Alpha Vantage pipeline;
         # keep a neutral default here so the column exists in every row.

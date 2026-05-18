@@ -339,9 +339,20 @@ class ExecutionService:
             return {"ok": False, "signal_id": signal_id,
                     "error": f"Market data unavailable for {symbol}"}
 
-        # Recalculate SL/TP from current price preserving the same distances
-        entry_distance = abs(entry - sl)
-        tp_distance = abs(tp - entry) if tp else entry_distance * 2
+        # Prefer ATR-scaled SL/TP when the signal carries them — the model's
+        # regression head learned noisy targets (MAE ~ size of the labels) so
+        # the model-predicted SL distance is often inside intraday noise.
+        # ATR stops scale with realised volatility and survive normal wiggle.
+        atr_sl = signal.get("atr_stop_loss")
+        atr_tp = signal.get("atr_take_profit")
+        if atr_sl and atr_tp:
+            sl_source = "atr"
+            entry_distance = abs(entry - atr_sl)
+            tp_distance    = abs(atr_tp - entry)
+        else:
+            sl_source = "model"
+            entry_distance = abs(entry - sl)
+            tp_distance    = abs(tp - entry) if tp else entry_distance * 2
 
         if action == "BUY":
             live_sl = round(current - entry_distance, sym_info["digits"])
@@ -353,7 +364,8 @@ class ExecutionService:
         # ── Place order ───────────────────────────────────────────────────────
         logger.info(
             f"📤 Placing {action} {volume} lots of {symbol} | "
-            f"current={current:.5f} SL={live_sl:.5f} TP={live_tp:.5f} | "
+            f"current={current:.5f} SL={live_sl:.5f} TP={live_tp:.5f} "
+            f"(sl_source={sl_source}) | "
             f"risk={config['risk_per_trade_pct']}% of {balance:.2f}"
         )
 

@@ -20,6 +20,7 @@ from app.ml.models.registry import (
 )
 from app.ml.training.trainer import Trainer, compute_class_weights
 from app.ml.evaluation.evaluator import ModelEvaluator
+from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -49,19 +50,52 @@ class MLService:
             )
         return row["timestamp"].isoformat() if row and row["timestamp"] else None
 
-    def _cache_path(self, ticker: str, interval: str, seq_len: int, ts: str) -> str:
+    def _cache_path(
+        self,
+        ticker: str,
+        interval: str,
+        seq_len: int,
+        ts: str,
+        buy_thresh: Optional[float] = None,
+        sell_thresh: Optional[float] = None,
+        lookahead: Optional[int] = None,
+        barrier_atr_mult: Optional[float] = None,
+    ) -> str:
         import hashlib
-        key = f"{ticker}|{interval}|{seq_len}|{ts}"
+        # Include label-affecting config in the key so changing barriers or
+        # lookahead invalidates stale cached labels automatically. Per-run
+        # overrides take precedence over settings so equities and FX runs
+        # never collide in the cache. `barrier_atr_mult` is part of the key
+        # too — vol-normalised labels produce a completely different label
+        # distribution than fixed thresholds, so they must not share a cache.
+        bt = buy_thresh  if buy_thresh  is not None else settings.BUY_THRESHOLD
+        st = sell_thresh if sell_thresh is not None else settings.SELL_THRESHOLD
+        la = lookahead   if lookahead   is not None else settings.LOOKAHEAD_WINDOW
+        am = barrier_atr_mult if barrier_atr_mult is not None else "none"
+        # `v` bumps whenever the FEATURE_COLS / FEATURE_COLS_FX layout changes
+        # so old-shape cached arrays don't get loaded into a wider-shape model.
+        # v2 = +DXY/VIX/yield_spread/us_2y, vol features (57 FX cols)
+        # v3 = +4h MTF features (61 FX cols) — regressed, rolled back
+        # v4 = back to 57 FX cols (MTF disabled)
+        key = f"{ticker}|{interval}|{seq_len}|{ts}|bt{bt}|st{st}|la{la}|am{am}|v4"
         digest = hashlib.md5(key.encode()).hexdigest()[:12]
         return os.path.join(_DATASET_CACHE_DIR, f"{ticker}_{interval}_{seq_len}_{digest}.npz")
 
     async def _load_ticker_cache(
         self, ticker: str, interval: str, seq_len: int,
+        buy_thresh: Optional[float] = None,
+        sell_thresh: Optional[float] = None,
+        lookahead: Optional[int] = None,
+        barrier_atr_mult: Optional[float] = None,
     ) -> Optional[tuple]:
         ts = await self._latest_bar_ts(ticker, interval)
         if ts is None:
             return None
-        path = self._cache_path(ticker, interval, seq_len, ts)
+        path = self._cache_path(
+            ticker, interval, seq_len, ts,
+            buy_thresh=buy_thresh, sell_thresh=sell_thresh,
+            lookahead=lookahead, barrier_atr_mult=barrier_atr_mult,
+        )
         if not os.path.exists(path):
             return None
         try:
@@ -73,12 +107,20 @@ class MLService:
 
     async def _save_ticker_cache(
         self, ticker: str, interval: str, seq_len: int, arrays: tuple,
+        buy_thresh: Optional[float] = None,
+        sell_thresh: Optional[float] = None,
+        lookahead: Optional[int] = None,
+        barrier_atr_mult: Optional[float] = None,
     ) -> None:
         ts = await self._latest_bar_ts(ticker, interval)
         if ts is None:
             return
         os.makedirs(_DATASET_CACHE_DIR, exist_ok=True)
-        path = self._cache_path(ticker, interval, seq_len, ts)
+        path = self._cache_path(
+            ticker, interval, seq_len, ts,
+            buy_thresh=buy_thresh, sell_thresh=sell_thresh,
+            lookahead=lookahead, barrier_atr_mult=barrier_atr_mult,
+        )
         p, s, c, r, t = arrays
         try:
             np.savez(path, p=p, s=s, c=c, r=r, t=t)
@@ -95,7 +137,31 @@ class MLService:
         lr:         float = 3e-4,
         use_class_weights: bool = True,
         diagnostics: bool = False,       # when True, also runs WF + permutation importance
+        asset_class: str = "equities",   # "equities" or "fx" — controls checkpoint folder
+        buy_threshold: Optional[float] = None,    # override settings.BUY_THRESHOLD per-run
+        sell_threshold: Optional[float] = None,   # override settings.SELL_THRESHOLD per-run
+        lookahead_window: Optional[int] = None,   # override settings.LOOKAHEAD_WINDOW per-run
+        barrier_atr_mult: Optional[float] = None, # when set: vol-normalised barriers (mult × ATR / close)
     ) -> dict:
+        from app.ml.models.registry import _paths_for, _normalize_asset_class
+        from app.ml.data.dataset import FEATURE_COLS_FX
+
+        # Normalise asset class to "equities" or "fx"; raises for unknown values
+        ac = _normalize_asset_class(asset_class)
+        ac_paths = _paths_for(ac)
+        logger.info(f"🏷️  Training asset_class={ac} (checkpoint dir: {ac_paths['dir']})")
+
+        # Resolve effective label-thresholds. None → fall through to settings.
+        eff_buy_t  = buy_threshold    if buy_threshold    is not None else None
+        eff_sell_t = sell_threshold   if sell_threshold   is not None else None
+        eff_la     = lookahead_window if lookahead_window is not None else None
+        eff_atr_m  = barrier_atr_mult if barrier_atr_mult is not None else None
+        if any(v is not None for v in (eff_buy_t, eff_sell_t, eff_la, eff_atr_m)):
+            logger.info(
+                f"🎚️  Label overrides: buy_thresh={eff_buy_t}, sell_thresh={eff_sell_t}, "
+                f"lookahead={eff_la}, barrier_atr_mult={eff_atr_m}  (None = use settings default)"
+            )
+
         logger.info(f"📦 Building dataset for {len(tickers)} tickers...")
 
         # ── Data quality pre-check ────────────────────────────────────────────
@@ -121,14 +187,26 @@ class MLService:
         cache_misses = 0
         for ticker in tickers:
             try:
-                cached = await self._load_ticker_cache(ticker, interval, seq_len)
+                cached = await self._load_ticker_cache(
+                    ticker, interval, seq_len,
+                    buy_thresh=eff_buy_t, sell_thresh=eff_sell_t,
+                    lookahead=eff_la, barrier_atr_mult=eff_atr_m,
+                )
                 if cached is not None:
                     p, s, c, r, t = cached
                     cache_hits += 1
                 else:
-                    p, s, c, r, t = await builder._build_ticker(ticker, interval, seq_len)
+                    p, s, c, r, t = await builder._build_ticker(
+                        ticker, interval, seq_len,
+                        buy_thresh=eff_buy_t, sell_thresh=eff_sell_t,
+                        lookahead=eff_la, barrier_atr_mult=eff_atr_m,
+                    )
                     if p is not None and len(p) > 0:
-                        await self._save_ticker_cache(ticker, interval, seq_len, (p, s, c, r, t))
+                        await self._save_ticker_cache(
+                            ticker, interval, seq_len, (p, s, c, r, t),
+                            buy_thresh=eff_buy_t, sell_thresh=eff_sell_t,
+                            lookahead=eff_la, barrier_atr_mult=eff_atr_m,
+                        )
                     cache_misses += 1
 
                 if p is not None and len(p) > 0:
@@ -158,8 +236,10 @@ class MLService:
         val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, drop_last=False)
         test_loader  = DataLoader(test_ds,  batch_size=batch_size, shuffle=False, drop_last=False)
 
+        # FX uses 54 features (51 base + 3 macro globals). Equities stays at 51.
+        n_feat = len(FEATURE_COLS_FX) if ac == "fx" else len(FEATURE_COLS)
         model_config = {
-            "n_features":         len(FEATURE_COLS),
+            "n_features":         n_feat,
             "seq_len":            seq_len,
             "d_model":            96,    # 64→96: more capacity for higher test accuracy
             "n_heads":            4,     # 96/4 = 24 dim/head
@@ -194,6 +274,7 @@ class MLService:
             lr=lr,
             class_weights=class_weights,
             checkpoint_name=ckpt_name,
+            checkpoint_dir=ac_paths["dir"],   # per-asset-class folder
         )
         train_results = trainer.fit(train_loader, val_loader, epochs=epochs)
         trainer.load_best()
@@ -206,7 +287,7 @@ class MLService:
         logger.info(f"🌡️  Calibrated temperature T={temperature:.4f} saved to model config")
 
         # ── Threshold auto-tuning ─────────────────────────────────────────────
-        tuned = self._tune_thresholds(model, val_loader, temperature)
+        tuned = self._tune_thresholds(model, val_loader, temperature, asset_class=ac)
         model_config["confidence_threshold"] = tuned["confidence_threshold"]
         model_config["margin_threshold"]     = tuned["margin_threshold"]
         logger.info(
@@ -218,13 +299,14 @@ class MLService:
         # (~3-5 min). Skipped in fast mode; opt-in via diagnostics=True.
         evaluator    = ModelEvaluator(model, interval=interval)
         eval_results = evaluator.evaluate(test_loader, with_permutation=diagnostics)
-        evaluator.save_report(eval_results)
+        eval_report_path = os.path.join(ac_paths["dir"], "eval_report.json")
+        evaluator.save_report(eval_results, path=eval_report_path)
 
-        save_model_config(model_config)
-        save_scaler_params(scaler_params)  # now a dict: ticker → {mean, std}
+        save_model_config(model_config,   asset_class=ac)
+        save_scaler_params(scaler_params, asset_class=ac)  # dict: ticker → {mean, std}
 
         from app.services.storage_service import upload
-        upload("eval_report.json", "checkpoints/eval_report.json")
+        upload(f"{ac}/eval_report.json", eval_report_path)
 
         # ── Walk-forward summary (3 folds, same data) ─────────────────────────
         # Skipped in fast mode (~15-20 min saved). Pass diagnostics=True to
@@ -250,10 +332,11 @@ class MLService:
                     if train_results["val_history"] else 0.0,
             eval_metrics=eval_results,
             tickers=tickers,
+            asset_class=ac,
         )
 
-        # Reload singleton so API immediately serves the new model
-        reload_model()
+        # Reload singleton for this asset class so the API immediately serves the new model
+        reload_model(ac)
 
         total_cls = all_cls
         return {
@@ -569,12 +652,20 @@ class MLService:
         model,
         val_loader,
         temperature: float = 1.0,
+        asset_class: str = "equities",
     ) -> dict:
         """Sweep confidence and margin thresholds on the validation set.
 
-        Objective: maximise F1 on BUY+SELL predictions subject to recall ≥ 5%.
-        Returns the (conf_threshold, margin_threshold) pair with the best F1.
-        Defaults (0.58 / 0.15) are returned when the sweep finds nothing better.
+        Progressive gate strategy:
+          1. Look for combos with `precision ≥ strict_floor` AND `recall ≥ 1%`.
+          2. If none qualify, relax to `precision ≥ relaxed_floor` AND `recall ≥ 0.5%`.
+          3. If still none qualify, return the combo with the highest F1 found
+             anywhere in the sweep — better than hard-coded defaults that
+             cause the live system to fire on every borderline prediction.
+
+        FX uses a lower precision floor (0.50/0.45) than equities (0.55/0.50)
+        because vol-normalised FX labels naturally produce a more balanced but
+        harder-to-discriminate classification task.
         """
         device = next(model.parameters()).device
         model.eval()
@@ -593,9 +684,6 @@ class MLService:
         probs  = np.concatenate(all_probs)   # (N, 3)
         labels = np.concatenate(all_labels)  # (N,)
 
-        best_f1  = -1.0
-        best     = {"confidence_threshold": 0.40, "margin_threshold": 0.05}
-
         max_probs  = probs.max(axis=1)
         pred_cls   = probs.argmax(axis=1)
         sorted_p   = np.sort(probs, axis=1)[:, ::-1]
@@ -603,12 +691,24 @@ class MLService:
         is_signal  = (labels == 1) | (labels == 2)     # true BUY or SELL
         total_true = max(is_signal.sum(), 1)
 
-        # Wider sweep with looser floors: when the model is HOLD-leaning, no
-        # combo passes recall≥5%, leaving thresholds at defaults that never
-        # fire. Drop floors to 1 prediction & 0.5% recall so we always pick
-        # *something* and surface the best the model is currently capable of.
-        for conf_t in np.arange(0.34, 0.80, 0.02):
-            for margin_t in np.arange(0.01, 0.35, 0.02):
+        # Per-asset-class precision floors.
+        if asset_class == "fx":
+            strict_floor,  strict_recall  = 0.50, 0.01
+            relaxed_floor, relaxed_recall = 0.45, 0.005
+        else:
+            strict_floor,  strict_recall  = 0.55, 0.01
+            relaxed_floor, relaxed_recall = 0.50, 0.005
+
+        # Sweep every combo once; record best-F1 along three independent tracks
+        # so we can fall back from strict → relaxed → any combo.
+        strict_best  = (-1.0, None)   # (f1, combo) for precision ≥ strict_floor
+        relaxed_best = (-1.0, None)   # for precision ≥ relaxed_floor
+        any_best     = (-1.0, None)   # any combo with at least one prediction
+        any_precision = 0.0
+        any_recall    = 0.0
+
+        for conf_t in np.arange(0.50, 0.85, 0.02):
+            for margin_t in np.arange(0.05, 0.35, 0.02):
                 passes  = (max_probs >= conf_t) & (margins >= margin_t) & (pred_cls != 0)
                 n_pred  = passes.sum()
                 if n_pred < 1:
@@ -617,28 +717,41 @@ class MLService:
                 tp        = ((pred_cls == labels) & passes).sum()
                 precision = tp / n_pred
                 recall    = tp / total_true
-                if recall < 0.005:
-                    continue
+                f1        = 2 * precision * recall / max(precision + recall, 1e-9)
 
-                f1 = 2 * precision * recall / max(precision + recall, 1e-9)
-                if f1 > best_f1:
-                    best_f1 = f1
-                    best = {
-                        "confidence_threshold": round(float(conf_t), 3),
-                        "margin_threshold":     round(float(margin_t), 3),
-                    }
+                combo = {
+                    "confidence_threshold": round(float(conf_t), 3),
+                    "margin_threshold":     round(float(margin_t), 3),
+                }
 
-        if best_f1 < 0:
-            logger.warning(
-                "⚠️  Threshold sweep found no usable combo — model produced "
-                "zero correct BUY/SELL predictions. Defaults will let it surface "
-                "low-confidence signals which the executor's EV filter will catch."
-            )
+                if f1 > any_best[0]:
+                    any_best       = (f1, combo)
+                    any_precision  = precision
+                    any_recall     = recall
+                if precision >= relaxed_floor and recall >= relaxed_recall and f1 > relaxed_best[0]:
+                    relaxed_best = (f1, combo)
+                if precision >= strict_floor and recall >= strict_recall and f1 > strict_best[0]:
+                    strict_best = (f1, combo)
+
+        # Pick the best result available along the strict→relaxed→any ladder
+        if strict_best[1] is not None:
+            tier = "strict"
+            best_f1, best = strict_best
+        elif relaxed_best[1] is not None:
+            tier = "relaxed"
+            best_f1, best = relaxed_best
+        elif any_best[1] is not None:
+            tier = "any (no precision gate)"
+            best_f1, best = any_best
         else:
-            logger.info(
-                f"🎯 Threshold sweep: conf={best['confidence_threshold']} "
-                f"margin={best['margin_threshold']} F1={best_f1:.4f}"
-            )
+            tier = "default"
+            best_f1, best = -1.0, {"confidence_threshold": 0.55, "margin_threshold": 0.10}
+
+        logger.info(
+            f"🎯 Threshold sweep [{asset_class}/{tier}]: "
+            f"conf={best['confidence_threshold']}  margin={best['margin_threshold']}  "
+            f"F1={best_f1:.4f}  any-best precision={any_precision:.3f} recall={any_recall:.3f}"
+        )
         return best
 
     # ── Data quality pre-check ────────────────────────────────────────────────
@@ -702,14 +815,22 @@ class MLService:
 
     async def predict_ticker(self, ticker: str, interval: str = "1d") -> dict:
         import json as _json
-        from app.ml.models.registry import get_model, load_scaler_params, MODEL_CFG_PATH
+        from app.ml.models.registry import get_model, load_scaler_params, _paths_for
         from app.services.cache_service import get_cache
+        from app.core.asset_class import asset_class_for
         from app.core.config import settings
+
+        # Route to the right model checkpoint based on the ticker's asset class.
+        # `asset_class_for` returns 'equity' / 'fx_major' / 'fx_metal'; the
+        # registry normalises those to 'equities' / 'fx' internally.
+        ac = asset_class_for(ticker)
+        paths = _paths_for(ac)
+        config_path = paths["config"]
 
         _mcfg: dict = {}
         try:
-            if os.path.exists(MODEL_CFG_PATH):
-                with open(MODEL_CFG_PATH) as _f:
+            if os.path.exists(config_path):
+                with open(config_path) as _f:
                     _mcfg = _json.load(_f)
         except Exception:
             pass
@@ -726,11 +847,11 @@ class MLService:
             logger.info(f"⚡ Cache hit: {cache_key}")
             return cached
 
-        model = get_model()
+        model = get_model(ac)
         if model is None:
-            return {"error": "Model not trained yet. Run POST /api/v1/ml/train first."}
+            return {"error": f"{paths['asset_class']} model not trained yet. Run POST /api/v1/ml/train first."}
 
-        scaler = load_scaler_params()
+        scaler = load_scaler_params(ac)
 
         builder = DatasetBuilder(self.pool)
         X_price, X_sent, _, _, _, _ = await builder.build(
@@ -786,13 +907,36 @@ class MLService:
                 std     = np.maximum(np.array(scaler["std"], dtype=np.float32), 1e-2)
                 X_price = np.clip((X_price - mean) / std, -10.0, 10.0)
 
+        # Mirror the trainer's NaN scrubbing: some indicators (e.g. MFI for FX
+        # tickers where yfinance's volume series is constant zero) produce
+        # NaNs through their entire history. Training zeroed them out via
+        # `torch.nan_to_num` so the model learned "0 = no signal" — inference
+        # must do the same or the softmax over NaN logits gives NaN probs.
+        X_price = np.nan_to_num(X_price, nan=0.0, posinf=0.0, neginf=0.0)
+        X_sent  = np.nan_to_num(X_sent,  nan=0.0, posinf=0.0, neginf=0.0)
+
         device  = next(model.parameters()).device
         x_price = torch.tensor(X_price[-1:], dtype=torch.float32).to(device)
         x_sent  = torch.tensor(X_sent[-1:],  dtype=torch.float32).to(device)
 
-        temperature           = float(_mcfg.get("temperature",           1.0))
+        # Temperature may be NaN if calibration failed (e.g., FX runs where
+        # validation set has too few non-HOLD samples to fit a scaler) —
+        # treat NaN as 1.0 (uncalibrated) instead of producing NaN softmax
+        # probabilities that crash the whole filter chain.
+        _temp_raw = _mcfg.get("temperature", 1.0)
+        try:
+            temperature = float(_temp_raw)
+            if not np.isfinite(temperature) or temperature <= 0:
+                temperature = 1.0
+        except (TypeError, ValueError):
+            temperature = 1.0
         _CONFIDENCE_THRESHOLD = float(_mcfg.get("confidence_threshold", 0.58))
         _MARGIN_THRESHOLD     = float(_mcfg.get("margin_threshold",     0.15))
+        # Per-asset-class action suppression: model_config can blacklist
+        # specific actions (e.g. FX disables SELL because per-class precision
+        # was anti-edge in validation). The filter chain downgrades these to
+        # HOLD before they reach the scoring stage.
+        _DISABLED_ACTIONS: set = set(_mcfg.get("disabled_actions") or [])
 
         current_ts = datetime.now(timezone.utc)
         # 8 MC samples gives ~80% of the uncertainty signal at ~40% the latency
@@ -814,22 +958,35 @@ class MLService:
         probs_sorted = sorted([prob_hold, prob_buy, prob_sell], reverse=True)
         prob_margin  = probs_sorted[0] - probs_sorted[1]
 
-        # Raw regression predictions (% deviations)
-        entry_offset_pct = float(result["entry_price"][0])
-        sl_pct_raw       = float(result["stop_loss"][0])
-        tp_pct_raw       = float(result["take_profit"][0])
-        net_pct          = float(result["net_profit"][0])
-        raw_bars         = float(result["bars_to_entry"][0])
-        timing_bucket    = int(result["timing_bucket"][0])
-        timing_bars      = float(result["timing_bars"][0])
+        # The regression and timing heads still exist in the architecture for
+        # checkpoint compatibility, but their outputs are ignored — SL/TP/
+        # entry are computed mechanically below from ATR. The model is used
+        # for direction only.
+        entry_offset_pct = 0.0
+        net_pct          = 0.0
+        raw_bars         = 1.0
+        timing_bucket    = 0
+        timing_bars      = 1.0
 
-        # Magnitudes for risk/reward — model returns signed values but we
-        # care about the absolute distance from entry in each direction.
-        abs_sl_pct = max(abs(sl_pct_raw), settings.MIN_PREDICTED_SL_PCT)
-        abs_tp_pct = abs(tp_pct_raw)
+        # ── ATR-mechanical SL/TP magnitudes ─────────────────────────────────────
+        # Direction-only magnitudes — actual dollar levels are recomputed below
+        # once we know which side of the entry the SL/TP should sit on. Using
+        # action="BUY" here just gives us the symmetric |distance| values; we
+        # branch into actual BUY/SELL/HOLD price math after the filter chain.
+        from app.strategies.atr_levels import compute_atr_levels
+        _mag = compute_atr_levels(atr_14, current_close, "BUY")
+        abs_sl_pct = max(_mag["abs_sl_pct"], settings.MIN_PREDICTED_SL_PCT)
+        abs_tp_pct = _mag["abs_tp_pct"]
 
         # ── Filter chain — each gate can downgrade action to HOLD ───────────────
         reject_reasons: list = []
+
+        # Gate 0: disabled-action veto (per-asset-class class suppression)
+        # FX disables SELL because validation showed it was anti-edge (35%
+        # precision). The list comes from model_config.json:disabled_actions.
+        if action in _DISABLED_ACTIONS:
+            reject_reasons.append(f"action_{action.lower()}_disabled_for_{paths['asset_class']}")
+            action = "HOLD"
 
         # Gate 1: confidence + margin (val-tuned thresholds)
         if action != "HOLD" and (confidence < _CONFIDENCE_THRESHOLD or prob_margin < _MARGIN_THRESHOLD):
@@ -889,10 +1046,12 @@ class MLService:
         bars_to_entry = min(max(raw_bars, 1.0), max_bars)
         entry_time = entry_time_from_bars(current_ts, bars_to_entry, interval)
 
-        # ── Dollar levels — now use model's PREDICTED TP, not a fixed 2:1 ──────
-        # Previously the TP was overridden with 2× SL distance, throwing away
-        # the regression head's TP prediction. Now we honour both.
-        entry_dollar = current_close * (1 + entry_offset_pct)
+        # ── Dollar levels — ATR-mechanical, no model regression involved ────────
+        # entry is the current close (no model-predicted offset); SL and TP are
+        # entry ± K × ATR. Both `*_dollar` and `atr_*_dollar` columns get the
+        # same ATR-based value so downstream (signals table, execution layer,
+        # dashboard) all see consistent realistic levels.
+        entry_dollar = current_close
         if action == "BUY":
             sl_dollar = entry_dollar * (1 - abs_sl_pct)
             tp_dollar = entry_dollar * (1 + abs_tp_pct)
@@ -902,20 +1061,8 @@ class MLService:
         else:  # HOLD
             sl_dollar = entry_dollar
             tp_dollar = entry_dollar
-
-        # ATR-scaled SL alternative (1.5× ATR) — exposed as a suggestion so
-        # an execution layer can pick volatility-adaptive stops when desired.
-        if atr_14 and atr_14 > 0 and action != "HOLD":
-            atr_sl_distance = 1.5 * atr_14
-            if action == "BUY":
-                atr_sl_dollar = entry_dollar - atr_sl_distance
-                atr_tp_dollar = entry_dollar + atr_sl_distance * predicted_rr
-            else:
-                atr_sl_dollar = entry_dollar + atr_sl_distance
-                atr_tp_dollar = entry_dollar - atr_sl_distance * predicted_rr
-        else:
-            atr_sl_dollar = sl_dollar
-            atr_tp_dollar = tp_dollar
+        atr_sl_dollar = sl_dollar
+        atr_tp_dollar = tp_dollar
 
         net_dollar = abs(tp_dollar - entry_dollar) - abs(sl_dollar - entry_dollar)
 
@@ -962,23 +1109,22 @@ class MLService:
                 "nfp_days":      round(nfp_days, 1),
                 "earnings_days": round(earnings_days, 1),
             },
-            # All five raw model predictions (% / float)
+            # ATR-mechanical levels (regression/timing heads no longer used)
             "predicted": {
-                "entry_offset_pct": round(entry_offset_pct, 6),
-                "stop_loss_pct":    round(sl_pct_raw, 6),
-                "take_profit_pct":  round(tp_pct_raw, 6),
-                "net_profit_pct":   round(net_pct, 6),
-                "bars_to_entry":    round(raw_bars, 4),
+                "entry_offset_pct": 0.0,
+                "stop_loss_pct":    round(abs_sl_pct, 6),
+                "take_profit_pct":  round(abs_tp_pct, 6),
+                "net_profit_pct":   round(abs_tp_pct - abs_sl_pct, 6),
+                "bars_to_entry":    1.0,
             },
-            # Timing head output
             "timing": {
-                "bucket":       timing_bucket,
-                "bucket_label": ["bar+1", "bar+2", "bar+3", "HOLD"][timing_bucket],
-                "bars":         timing_bars,
-                "probs":        [round(p, 4) for p in result["timing_probs"][0]],
+                "bucket":       0,
+                "bucket_label": "bar+1",
+                "bars":         1.0,
+                "probs":        [1.0, 0.0, 0.0, 0.0],
             },
             "anchor_close": round(current_close, 4),
-            "source":       "ml_model",
+            "source":       "ml_fx" if ac in ("fx_major", "fx_metal", "fx") else "ml_equities",
             "generated_at": current_ts.isoformat(),
         }
 

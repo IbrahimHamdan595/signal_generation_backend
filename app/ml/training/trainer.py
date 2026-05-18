@@ -76,10 +76,18 @@ class Trainer:
         lr: float = 2e-4,
         weight_decay: float = 5e-4,
         cls_weight: float = 1.0,
-        reg_weight: float = 0.3,
-        timing_weight: float = 0.1,
+        # Regression and timing heads are kept in the architecture for
+        # backward-compat with existing checkpoints, but their loss weights
+        # are 0 so the shared backbone focuses 100% on direction. SL/TP are
+        # now computed mechanically from ATR at inference (see
+        # ml_service.predict_ticker), not from these heads — keeping their
+        # gradients off prevents the heads from pulling backbone capacity
+        # toward an unpredictable, path-dependent target (where price stops).
+        reg_weight: float = 0.0,
+        timing_weight: float = 0.0,
         patience: int = 10,             # cut early when val plateaus — avoids 28-epoch overfit runs
         checkpoint_name: str = "best_model.pt",
+        checkpoint_dir: Optional[str] = None,   # defaults to CHECKPOINT_DIR (equities), pass "checkpoints/fx" for FX
         class_weights: Optional[torch.Tensor] = None,
         timing_class_weights: Optional[torch.Tensor] = None,
     ):
@@ -129,7 +137,11 @@ class Trainer:
         self.reg_weight    = reg_weight
         self.timing_weight = timing_weight
         self.patience      = patience
-        self.checkpoint_path = os.path.join(CHECKPOINT_DIR, checkpoint_name)
+        # Per-asset-class layout: callers pass `checkpoint_dir="checkpoints/fx"`
+        # to land the new versioned `.pt` files inside the right subfolder.
+        ckpt_dir = checkpoint_dir or CHECKPOINT_DIR
+        os.makedirs(ckpt_dir, exist_ok=True)
+        self.checkpoint_path = os.path.join(ckpt_dir, checkpoint_name)
 
         self.train_history: list = []
         self.val_history:   list = []

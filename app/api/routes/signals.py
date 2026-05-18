@@ -41,7 +41,7 @@ def _to_response(doc: dict) -> SignalResponse:
         prob_buy=doc.get("prob_buy"),
         prob_sell=doc.get("prob_sell"),
         prob_hold=doc.get("prob_hold"),
-        source=doc.get("source", "ml_model"),
+        source=doc.get("source", "ml_equities"),
         created_at=doc.get("created_at"),
     )
 
@@ -89,13 +89,31 @@ async def generate_batch(
     pool=Depends(get_db),
     current_user=Depends(get_current_active_user),
 ):
+    """Three-way batch generation:
+      - ML for all submitted tickers (auto-routed per-ticker by predict_ticker)
+      - Donchian rule-based on FX-only tickers in the submitted list
+
+    Returns immediately with [] — generation runs in the background and
+    results land in the signals table within ~30s for typical batches.
+    """
     _check_model()
-    if len(body.tickers) > 50:
-        raise HTTPException(400, "Max 50 tickers per batch request")
+    if len(body.tickers) > 100:
+        raise HTTPException(400, "Max 100 tickers per batch request")
 
     async def _run():
-        svc = SignalService(pool)
-        await svc.generate_batch(body.tickers, body.interval)
+        from app.core.asset_class import is_fx
+        from app.strategies.donchian import DonchianService
+
+        # ML signals — covers both equities and FX (each tagged with the
+        # appropriate source automatically via SignalService).
+        ml_svc = SignalService(pool)
+        await ml_svc.generate_batch(body.tickers, body.interval)
+
+        # Donchian rule-based — FX only.
+        fx_tickers = [t for t in body.tickers if is_fx(t)]
+        if fx_tickers:
+            donchian = DonchianService(pool)
+            await donchian.generate_batch(fx_tickers, body.interval)
 
     background_tasks.add_task(_run)
     return []

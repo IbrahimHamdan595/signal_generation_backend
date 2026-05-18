@@ -24,7 +24,10 @@ Download: https://www.metatrader5.com/en/download
 import asyncio
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional
+from datetime import datetime, date as date_t, timezone
+from typing import Optional, Union
+
+import pandas as pd
 
 logger = logging.getLogger(__name__)
 
@@ -283,6 +286,77 @@ class BrokerService:
             return price if price > 0 else None
 
         return await _run(_price)
+
+    # ── Historical bars ───────────────────────────────────────────────────────
+
+    async def get_bars(
+        self,
+        symbol: str,
+        interval: str,
+        start: Union[datetime, date_t],
+        end: Optional[Union[datetime, date_t]] = None,
+    ) -> pd.DataFrame:
+        """
+        Fetch historical OHLCV bars from MT5 in the same DataFrame shape the
+        OHLCVService yfinance path produces:
+            columns: timestamp, open, high, low, close, volume
+            timestamp dtype: datetime64
+
+        `interval` accepts the same strings the rest of the codebase uses
+        ('1d', '1h', '30m', '15m', '5m', '1m'). `start`/`end` accept date or
+        datetime; date is promoted to midnight UTC.
+
+        Returns an empty DataFrame when MT5 has no bars for the symbol in the
+        requested range — callers should handle this the same as yfinance's
+        "no new bars" case (return 0 without raising).
+        """
+        def _fetch():
+            mt5 = _import_mt5()
+
+            tf_map = {
+                "1m":  mt5.TIMEFRAME_M1,
+                "5m":  mt5.TIMEFRAME_M5,
+                "15m": mt5.TIMEFRAME_M15,
+                "30m": mt5.TIMEFRAME_M30,
+                "1h":  mt5.TIMEFRAME_H1,
+                "4h":  mt5.TIMEFRAME_H4,
+                "1d":  mt5.TIMEFRAME_D1,
+                "1w":  mt5.TIMEFRAME_W1,
+            }
+            timeframe = tf_map.get(interval)
+            if timeframe is None:
+                raise ValueError(
+                    f"MT5.get_bars: unsupported interval={interval!r}. "
+                    f"Supported: {sorted(tf_map.keys())}"
+                )
+
+            def _as_dt(x):
+                if isinstance(x, datetime):
+                    return x
+                return datetime(x.year, x.month, x.day, tzinfo=timezone.utc)
+
+            start_dt = _as_dt(start)
+            end_dt   = _as_dt(end) if end is not None else datetime.now(timezone.utc)
+
+            # Make sure the symbol is selected — without symbol_select, MT5
+            # may return None even for symbols that exist in the broker's
+            # market watch but aren't currently subscribed.
+            mt5.symbol_select(symbol, True)
+
+            rates = mt5.copy_rates_range(symbol, timeframe, start_dt, end_dt)
+            if rates is None or len(rates) == 0:
+                return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+
+            df = pd.DataFrame(rates)
+            df["timestamp"] = pd.to_datetime(df["time"], unit="s", utc=True).dt.tz_localize(None)
+            # MT5 reports `tick_volume` (number of ticks in the bar) and
+            # `real_volume` (only when broker reports it; 0 otherwise).
+            # tick_volume is the right "volume" surrogate for FX where real
+            # volume isn't available — matches how MT5's own charts show it.
+            df["volume"] = df["tick_volume"].astype(float)
+            return df[["timestamp", "open", "high", "low", "close", "volume"]]
+
+        return await _run(_fetch)
 
     # ── Order placement ───────────────────────────────────────────────────────
 

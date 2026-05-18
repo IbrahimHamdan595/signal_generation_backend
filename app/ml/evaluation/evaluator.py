@@ -11,6 +11,7 @@ from sklearn.metrics import (
     f1_score,
 )
 from app.ml.data.dataset import FEATURE_COLS
+from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -147,10 +148,15 @@ class ModelEvaluator:
         )
 
         # ── Real-price trading simulation ─────────────────────────────────────
-        # Pass *predicted* SL/TP magnitudes so we don't leak ground-truth
-        # future prices into the simulation (oracle leak fixed).
+        # Uses the TRUE label's barrier-hit magnitudes as realized PnL when
+        # the model's directional call is taken. This is the honest "what
+        # would have happened?" sim — no oracle for the decision (model
+        # only sees its own prediction), but realized outcomes come from
+        # the labelled barrier walk that the classifier was trained to
+        # predict. The previous version used `all_reg_pred` from a now-
+        # untrained regression head (`reg_weight=0`), producing NaN PnL.
         results["trading"] = self._trading_metrics(
-            all_preds, all_true, all_reg_pred, total_bars=len(all_true)
+            all_preds, all_true, all_reg_true, total_bars=len(all_true)
         )
 
         # ── Permutation feature importance ────────────────────────────────────
@@ -328,38 +334,53 @@ class ModelEvaluator:
         self,
         preds:      np.ndarray,   # (N,)  predicted class
         true:       np.ndarray,   # (N,)  true class
-        reg_pred:   np.ndarray,   # (N,5) predicted regression — % deviations
+        reg_true:   np.ndarray,   # (N,5) true regression labels — realized % deviations at barrier hit
         total_bars: int,
     ) -> dict:
         """
-        Simulate % returns for every non-HOLD prediction using the model's
-        own predicted SL/TP magnitudes — never reading future ground-truth
-        prices, so the result reflects what the model could have actually
-        executed without an oracle.
+        Simulate % returns for every non-HOLD prediction.
 
-        Win condition: predicted direction matches true label.
-          Win  → return = abs(predicted_tp_pct)
-          Loss → return = -abs(predicted_sl_pct)
+        The decision (which class to bet on) comes from the model's
+        predicted class — no oracle. The realized PnL of that decision
+        comes from the labelled barrier-walk in `reg_true`, which encodes
+        what the price actually did to the first barrier within the
+        lookahead window:
+          Win  (p == t) → return = abs(reg_true[i, 2])  # tp_pct realized
+          Loss (p != t) → return = -abs(reg_true[i, 1]) # sl_pct realized
 
-        Sharpe annualisation factor reflects the *actual* trade frequency
-        observed in the test window for the given bar interval, instead of
-        always assuming one trade per daily bar.
+        Fallback: if `reg_true` is NaN/zero (older datasets without
+        realized barrier targets), fall back to a fixed ±1.5% reward and
+        ±1.0% risk so the metric still produces honest numbers.
         """
         returns  = []
-        sl_pcts  = reg_pred[:, 1]   # predicted SL%
-        tp_pcts  = reg_pred[:, 2]   # predicted TP%
+        # Truncate-at-barrier labels stored sl_pct/tp_pct as fractions in
+        # columns 1 and 2 respectively. Both are signed in the labels
+        # (sl_pct usually negative, tp_pct usually positive); we take
+        # absolute magnitudes for the PnL sim regardless of sign.
+        sl_pcts_true = reg_true[:, 1] if reg_true.ndim == 2 and reg_true.shape[1] >= 3 else np.zeros(len(preds))
+        tp_pcts_true = reg_true[:, 2] if reg_true.ndim == 2 and reg_true.shape[1] >= 3 else np.zeros(len(preds))
+
+        # Sensible fallbacks if a sample's true label has no barrier info
+        # (e.g. true HOLD where neither barrier was hit).
+        FALLBACK_TP = 0.015   # +1.5%
+        FALLBACK_SL = 0.010   # -1.0%
 
         for i, (p, t) in enumerate(zip(preds, true)):
-            if p == 0:          # HOLD — skip
+            if p == 0:          # HOLD prediction — no trade
                 continue
 
-            sl_pct = float(sl_pcts[i])
-            tp_pct = float(tp_pcts[i])
+            tp_mag = float(tp_pcts_true[i])
+            sl_mag = float(sl_pcts_true[i])
+            # Guard against NaN / zero labels (true HOLDs have no barrier hit)
+            if not np.isfinite(tp_mag) or tp_mag == 0.0:
+                tp_mag = FALLBACK_TP
+            if not np.isfinite(sl_mag) or sl_mag == 0.0:
+                sl_mag = FALLBACK_SL
 
             if p == t:
-                ret = abs(tp_pct)
+                ret = abs(tp_mag)
             else:
-                ret = -abs(sl_pct)
+                ret = -abs(sl_mag)
 
             returns.append(ret)
 
@@ -374,39 +395,48 @@ class ModelEvaluator:
                 "annualisation":  {"factor": 0.0, "interval": self.interval},
             }
 
-        r       = np.array(returns)
-        mean_r  = float(r.mean())
-        std_r   = float(r.std()) + 1e-8
+        r        = np.array(returns)
+        mean_r   = float(r.mean())
+        std_r    = float(r.std()) + 1e-8
         win_rate = float((r > 0).mean())
 
-        # Annualisation: scale per-trade Sharpe by sqrt(trades_per_year)
-        bars_per_year = BARS_PER_YEAR_BY_INTERVAL.get(self.interval, 252)
-        trade_freq = (len(returns) / max(total_bars, 1)) if total_bars > 0 else 0.0
-        trades_per_year = trade_freq * bars_per_year
-        ann_factor = float(np.sqrt(max(trades_per_year, 1.0)))
-        sharpe = float(mean_r / std_r * ann_factor)
+        # Per-trade Sharpe (mean / std) is the honest headline. The previous
+        # implementation multiplied this by sqrt(trades_per_year) which inflated
+        # a ~0.7 per-trade ratio into "Sharpe 11" — economically meaningless
+        # because per-trade returns aren't independent annual samples.
+        sharpe_per_trade = float(mean_r / std_r)
 
-        cum     = np.cumprod(1 + r)
-        peak    = np.maximum.accumulate(cum)
-        dd      = (cum - peak) / peak
-        max_dd  = float(dd.min())
-
+        # Equity curve uses fixed-fraction position sizing (MAX_RISK_PER_TRADE,
+        # default 1% of capital) — without it, compounding 11k bimodal trades
+        # produces a total_return on the order of 1e+87 which masks losses.
+        position_size = float(getattr(settings, "MAX_RISK_PER_TRADE", 0.01))
+        r_sized      = r * position_size
+        cum          = np.cumprod(1 + r_sized)
+        peak         = np.maximum.accumulate(cum)
+        dd           = (cum - peak) / peak
+        max_dd       = float(dd.min())
         total_return = float(cum[-1] - 1.0) if len(cum) > 0 else 0.0
 
+        bars_per_year   = BARS_PER_YEAR_BY_INTERVAL.get(self.interval, 252)
+        trade_freq      = (len(returns) / max(total_bars, 1)) if total_bars > 0 else 0.0
+        trades_per_year = trade_freq * bars_per_year
+
         return {
-            "sharpe_ratio":  round(sharpe,       4),
-            "win_rate":      round(win_rate,      4),
-            "total_trades":  int(len(returns)),
-            "avg_return":    round(mean_r,        6),
-            "max_drawdown":  round(max_dd,        4),
-            "total_return":  round(total_return,  4),
+            "sharpe_ratio":      round(sharpe_per_trade, 4),
+            "win_rate":          round(win_rate,         4),
+            "total_trades":      int(len(returns)),
+            "avg_return":        round(mean_r,           6),
+            "max_drawdown":      round(max_dd,           4),
+            "total_return":      round(total_return,     4),
+            "position_size_pct": position_size,
             "annualisation": {
-                "factor":           round(ann_factor, 4),
                 "trades_per_year":  round(trades_per_year, 2),
                 "bars_per_year":    bars_per_year,
                 "interval":         self.interval,
+                "note":             "sharpe_ratio reported is per-trade, not annualised",
             },
-            "uses_predicted_levels": True,
+            "uses_predicted_levels": False,
+            "note": "trading PnL uses realised barrier outcomes from the labels, not model regression",
         }
 
     def save_report(

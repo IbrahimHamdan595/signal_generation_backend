@@ -27,6 +27,7 @@ def _record_signal_probs(probs: dict) -> None:
 from app.services.ml_service import MLService
 from app.services.alert_service import AlertService
 from app.ml.models.registry import is_model_trained, get_model
+from app.core.asset_class import is_fx as _is_fx_ticker
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +90,7 @@ class SignalService:
                     $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
                     $21, $22, $23::jsonb, $24, $25, $26, $27, $28, $29, $30, $31
                 )
-                ON CONFLICT (ticker, interval, DATE(created_at AT TIME ZONE 'UTC'))
+                ON CONFLICT (ticker, interval, DATE(created_at AT TIME ZONE 'UTC'), COALESCE(source, ''))
                 DO UPDATE SET
                     action              = EXCLUDED.action,
                     confidence          = EXCLUDED.confidence,
@@ -150,7 +151,7 @@ class SignalService:
                 event_prox.get("cpi_days"),
                 event_prox.get("nfp_days"),
                 event_prox.get("earnings_days"),
-                "ml_model",
+                "ml_equities" if not _is_fx_ticker(ticker) else "ml_fx",
                 datetime.now(timezone.utc),
             )
 
@@ -204,7 +205,7 @@ class SignalService:
             "interval": interval,
             "action": result.get("action", "HOLD"),
             "confidence": result.get("confidence", 0.0),
-            "source": "ml_model",
+            "source": result.get("source") or ("ml_fx" if _is_fx_ticker(ticker) else "ml_equities"),
             **{
                 k: result[k]
                 for k in (

@@ -2,7 +2,7 @@ from fastapi import APIRouter
 from app.api.routes import (
     auth, users, ingest, market, sentiment,
     ml, signals, alerts, outcomes, backtest, confluence, ws,
-    portfolio, price_alerts, jobs, trading, live_edge,
+    portfolio, price_alerts, jobs, trading, live_edge, reports, pipelines,
 )
 
 api_router = APIRouter(prefix="/api/v1")
@@ -23,3 +23,5 @@ api_router.include_router(price_alerts.router)
 api_router.include_router(jobs.router)
 api_router.include_router(trading.router)
 api_router.include_router(live_edge.router)
+api_router.include_router(reports.router)
+api_router.include_router(pipelines.router)

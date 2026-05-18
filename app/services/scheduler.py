@@ -6,6 +6,7 @@ import logging
 
 from app.db.database import get_db
 from app.services.ohlcv_service import OHLCVService
+from app.services.macro_feature_service import MacroFeatureService
 from app.services.sentiment_service import SentimentService
 from app.services.signal_service import SignalService
 from app.services.outcome_service import OutcomeService
@@ -173,27 +174,105 @@ async def enrich_social_sentiment():
         raise
 
 
-async def regenerate_signals():
-    if not is_model_trained():
-        logger.info("⏭  Signal regen skipped — model not trained yet.")
-        return
+async def refresh_fx_macros():
+    """Daily job: pull DXY, VIX, and 10Y/2Y yield spread into fx_macro_features.
 
-    logger.info("🔄 Scheduler: regenerating signals...")
+    These three values drive the global macro columns the FX model sees;
+    they refresh once per day after the daily OHLCV ingest so the new
+    bar's macro context is ready before the next signal regeneration.
+    """
+    logger.info("🔄 Scheduler: refreshing FX macro features...")
+    try:
+        pool = await get_db()
+        if pool is None:
+            logger.info("⏭  Macro refresh skipped — DB pool unavailable")
+            return
+        svc = MacroFeatureService(pool)
+        n = await svc.refresh_fx_macros(years_back=1.0)
+        logger.info(f"✅ FX macro features refreshed: {n} dates upserted")
+    except Exception as e:
+        logger.error(f"❌ FX macro refresh error: {e}")
+        raise
+
+
+async def regenerate_signals():
+    """Three-way signal regeneration honouring pipeline_config.enabled.
+
+    Each pipeline's enable flag lives in `pipeline_config`. Disabled
+    pipelines are skipped silently. After each pipeline runs (success or
+    failure), we UPSERT `last_run_at`/`last_signals_count`/`last_error`
+    so the /pipeline page can show status without a separate health check.
+    """
+    logger.info("🔄 Scheduler: regenerating signals (three-way)...")
     try:
         pool = await get_db()
         tickers = await _get_tracked_tickers()
         if not tickers:
             logger.info("⏭  Signal regen skipped — no tracked tickers.")
             return
-        svc = SignalService(pool)
 
-        results = await svc.generate_batch(tickers, "1d")
-        logger.info(f"✅ Signals [1d]: {len(results)} generated")
+        from app.core.asset_class import is_fx
+        from app.strategies.donchian import DonchianService
+        from app.api.routes.pipelines import get_enabled_sources, record_run
+
+        enabled = await get_enabled_sources(pool)
+
+        fx_tickers     = [t for t in tickers if is_fx(t)]
+        equity_tickers = [t for t in tickers if not is_fx(t)]
+
+        # ── ML equities ──────────────────────────────────────────────────────
+        if "ml_equities" in enabled:
+            if is_model_trained("equities") and equity_tickers:
+                try:
+                    svc = SignalService(pool)
+                    ml_eq_results = await svc.generate_batch(equity_tickers, "1d")
+                    await record_run(pool, "ml_equities", signals_count=len(ml_eq_results))
+                    logger.info(f"✅ ML equities: {len(ml_eq_results)} ({len(equity_tickers)} submitted)")
+                except Exception as e:
+                    await record_run(pool, "ml_equities", error=f"{type(e).__name__}: {e}")
+                    logger.error(f"❌ ML equities failed: {e}")
+            else:
+                logger.info("⏭  ML equities: skipped (no checkpoint or no equity tickers)")
+        else:
+            logger.info("⏭  ML equities: pipeline disabled in config")
+
+        # ── ML FX ────────────────────────────────────────────────────────────
+        if "ml_fx" in enabled:
+            if is_model_trained("fx") and fx_tickers:
+                try:
+                    svc = SignalService(pool)
+                    ml_fx_results = await svc.generate_batch(fx_tickers, "1d")
+                    await record_run(pool, "ml_fx", signals_count=len(ml_fx_results))
+                    logger.info(f"✅ ML FX: {len(ml_fx_results)} ({len(fx_tickers)} submitted)")
+                except Exception as e:
+                    await record_run(pool, "ml_fx", error=f"{type(e).__name__}: {e}")
+                    logger.error(f"❌ ML FX failed: {e}")
+            else:
+                logger.info("⏭  ML FX: skipped (no checkpoint or no FX tickers)")
+        else:
+            logger.info("⏭  ML FX: pipeline disabled in config")
+
+        # ── Donchian rule-based (FX only) ────────────────────────────────────
+        if "rule_donchian" in enabled:
+            if fx_tickers:
+                try:
+                    donchian = DonchianService(pool)
+                    d_results = await donchian.generate_batch(fx_tickers, "1d")
+                    await record_run(pool, "rule_donchian", signals_count=len(d_results))
+                    logger.info(f"📐 Donchian: {len(d_results)} ({len(fx_tickers)} submitted)")
+                except Exception as e:
+                    await record_run(pool, "rule_donchian", error=f"{type(e).__name__}: {e}")
+                    logger.error(f"❌ Donchian failed: {e}")
+            else:
+                logger.info("⏭  Donchian: no FX tickers")
+        else:
+            logger.info("⏭  Donchian: pipeline disabled in config")
+
     except Exception as e:
         logger.error(f"❌ Signal regen error: {e}")
         raise
 
-    # Auto-execute for any users with auto_trade = TRUE
+    # Auto-execute pulls all non-HOLD signals from every source by EV.
     await _auto_execute_trading(pool)
 
 
@@ -238,6 +317,15 @@ def start_scheduler():
         refresh_daily_data,
         CronTrigger(hour=17, minute=5),
         id="daily_data",
+        replace_existing=True,
+    )
+
+    # 5 minutes after daily OHLCV — gives equity ingest time to finish before
+    # the FX model has its macro context refreshed for the new bar.
+    scheduler.add_job(
+        refresh_fx_macros,
+        CronTrigger(hour=17, minute=10),
+        id="fx_macros",
         replace_existing=True,
     )
 
