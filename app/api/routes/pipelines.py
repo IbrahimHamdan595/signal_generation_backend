@@ -224,6 +224,94 @@ async def run_all(
     return {"status": "scheduled", "sources": sorted(enabled)}
 
 
+@router.post("/reset")
+async def reset_pipeline_state(
+    pool=Depends(get_db),
+    current_user=Depends(get_current_active_user),
+):
+    """Admin reset — clears transient state so the system starts fresh.
+
+    Touches four tables in a single transaction:
+
+    - `trade_executions`: stale `pending` rows flipped to `failed` so blocked
+      signal_ids can be retried on the next auto-execute cycle.
+    - `pipeline_config`: `last_run_at` / `last_signals_count` / `last_error`
+      reset to NULL so the /strategies cards show "awaiting first run".
+    - `equity_snapshots`: today's row is deleted so the next health check
+      rebases the equity guardrail at the current MT5 equity (avoids a
+      stale peak triggering EQUITY_HALT).
+    - `trading_config`: `auto_trade` flipped back to TRUE for every user
+      that had it (lets execution resume after a guardrail halt).
+
+    Does NOT delete historical signals, executions history, or model
+    checkpoints. Does NOT kill in-flight stuck APScheduler jobs — the
+    Python process must be restarted for that.
+    """
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            # 1. Count pending orders before clearing so we can report it
+            pending_count = await conn.fetchval(
+                "SELECT COUNT(*) FROM trade_executions WHERE status = 'pending'"
+            ) or 0
+            await conn.execute(
+                """
+                UPDATE trade_executions
+                SET status = 'failed',
+                    error  = COALESCE(error, 'cleared by /pipelines/reset')
+                WHERE status = 'pending'
+                """
+            )
+
+            # 2. Wipe per-pipeline last-run state
+            await conn.execute(
+                """
+                UPDATE pipeline_config
+                SET last_run_at        = NULL,
+                    last_signals_count = NULL,
+                    last_error         = NULL,
+                    updated_at         = NOW()
+                """
+            )
+
+            # 3. Rebase today's equity guardrail
+            equity_deleted = await conn.fetchval(
+                """
+                WITH d AS (DELETE FROM equity_snapshots WHERE date = CURRENT_DATE RETURNING 1)
+                SELECT COUNT(*) FROM d
+                """
+            ) or 0
+
+            # 4. Re-enable auto_trade everywhere it was off
+            auto_trade_reenabled = await conn.fetchval(
+                """
+                WITH u AS (
+                    UPDATE trading_config SET auto_trade = TRUE
+                    WHERE auto_trade = FALSE
+                    RETURNING 1
+                )
+                SELECT COUNT(*) FROM u
+                """
+            ) or 0
+
+    logger.info(
+        f"Pipeline state reset by user {current_user.get('id')}: "
+        f"pending_cleared={pending_count}, "
+        f"equity_rebased={equity_deleted}, "
+        f"auto_trade_reenabled={auto_trade_reenabled}"
+    )
+    return {
+        "status":                 "reset",
+        "pending_orders_cleared": pending_count,
+        "pipeline_cards_reset":   True,
+        "equity_snapshot_rebased": bool(equity_deleted),
+        "auto_trade_reenabled":   auto_trade_reenabled,
+        "note": (
+            "If a job is hung mid-execution, restart the backend — this endpoint "
+            "cannot interrupt running coroutines."
+        ),
+    }
+
+
 # ── Background runner ─────────────────────────────────────────────────────────
 
 async def _run_pipeline(pool, source: str) -> None:
