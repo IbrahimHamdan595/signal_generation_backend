@@ -20,6 +20,13 @@ OHLCV_COLS = ["open", "high", "low", "close", "volume"]
 # anything older is from a different macro regime anyway.
 MAX_HISTORY_YEARS = 15
 
+# The 4h indicators table is much denser (6 bars/day × 5 active days/week)
+# than 1d. yfinance only returns ~2 years of 4h history for FX pairs, so a
+# 15-year cap on this query reads ~22k empty index pages for tickers that
+# physically can't have older 4h data. Cap to 3 years for healthy headroom
+# and to reduce per-ticker query size from ~22k rows to ~4k.
+MAX_4H_HISTORY_YEARS = 3
+
 # Retry the dataset fetch on transient pooler disconnects. asyncpg's
 # PostgresConnectionError / InterfaceError signature for the cloud-pooler kill
 # is "connection was closed in the middle of operation" — those are spurious,
@@ -443,7 +450,7 @@ class DatasetBuilder:
                 SELECT timestamp, rsi_14, macd_histogram, atr_14, roc_5
                 FROM indicators
                 WHERE ticker = $1 AND interval = '4h'
-                  AND timestamp >= NOW() - INTERVAL '{MAX_HISTORY_YEARS} years'
+                  AND timestamp >= NOW() - INTERVAL '{MAX_4H_HISTORY_YEARS} years'
                 ORDER BY timestamp ASC
                 """,
                 ticker,

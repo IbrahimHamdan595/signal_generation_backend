@@ -224,6 +224,81 @@ async def run_all(
     return {"status": "scheduled", "sources": sorted(enabled)}
 
 
+@router.post("/run-all-and-trade")
+async def run_all_and_trade(
+    pool=Depends(get_db),
+    current_user=Depends(get_current_active_user),
+):
+    """Run every enabled pipeline (signal generation), then immediately
+    auto-execute with the per-pipeline quota policy.
+
+    Combines /pipelines/run-all (generate signals from each enabled pipeline)
+    and the auto-execute step from /trading/run-now into one call. Unlike
+    /trading/run-now this runs on every tracked ticker (not just broker-valid);
+    signals for non-broker tickers fail at per-trade broker validation and
+    are skipped without polluting the executions table.
+
+    Synchronous — the HTTP request stays open until generation + execution
+    both complete. Typical wall-clock: 1–3 minutes depending on universe
+    size and DB latency. The caller should expect a long timeout.
+    """
+    # ── Guards ────────────────────────────────────────────────────────────
+    from app.services.broker_service import BrokerService
+    from app.services.execution_service import ExecutionService
+
+    broker = BrokerService()
+    if not await broker.is_connected():
+        raise HTTPException(400, "MT5 not connected — call POST /trading/connect first")
+
+    exec_svc = ExecutionService(pool, broker)
+    cfg = await exec_svc.get_config(current_user["id"])
+    if not cfg or not cfg.get("enabled"):
+        raise HTTPException(400, "Trading not enabled — configure it first")
+    if not cfg.get("auto_trade"):
+        raise HTTPException(400, "Auto-trade is off — enable it in Risk Configuration")
+
+    enabled = await get_enabled_sources(pool)
+    if not enabled:
+        return {"status": "noop", "reason": "no pipelines enabled"}
+
+    # ── Phase 1: generate signals from every enabled pipeline (sequential) ─
+    # Sequential so the three pipelines don't contend for the GPU and the DB
+    # pool. record_run is called after each so /strategies cards show fresh
+    # last_run_at as the run progresses.
+    pipeline_results: dict[str, dict] = {}
+    for src in sorted(enabled):
+        try:
+            n = await _run_pipeline_inner(pool, src)
+            await record_run(pool, src, signals_count=n, error=None)
+            logger.info(f"✅ pipeline {src}: {n} signals generated")
+            pipeline_results[src] = {"signals_generated": n, "ok": True}
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            try:
+                await record_run(pool, src, signals_count=None, error=err)
+            except Exception:
+                pass
+            logger.error(f"❌ pipeline {src} failed: {err}")
+            pipeline_results[src] = {"signals_generated": 0, "ok": False, "error": err}
+
+    # ── Phase 2: auto-execute with per-pipeline quota ──────────────────────
+    # auto_execute already applies: top-conf within each pipeline, even quota
+    # across enabled pipelines, redistribute leftover slots, interleaved order.
+    results = await exec_svc.auto_execute(current_user["id"])
+    filled = [r for r in results if r.get("ok")]
+    failed = [r for r in results if not r.get("ok")]
+
+    return {
+        "status":           "complete",
+        "pipelines":        pipeline_results,
+        "orders_attempted": len(results),
+        "orders_filled":    len(filled),
+        "orders_failed":    len(failed),
+        "filled":           filled,
+        "failed":           failed,
+    }
+
+
 @router.post("/reset")
 async def reset_pipeline_state(
     pool=Depends(get_db),
@@ -249,15 +324,25 @@ async def reset_pipeline_state(
     """
     async with pool.acquire() as conn:
         async with conn.transaction():
-            # 1. Count pending orders before clearing so we can report it
+            # 1. Count pending orders before clearing so we can report it.
+            # trade_executions uses status values: pending | filled | closed |
+            # cancelled | error (per migration 0002). We mark stale pending
+            # rows as 'cancelled' — it's the closest terminal state and falls
+            # outside auto_execute's NOT-EXISTS filter (which excludes only
+            # 'filled' and 'pending'), so the same signal_id can be retried.
+            # Audit trail goes into mt5_comment, not 'error' (no such column).
             pending_count = await conn.fetchval(
                 "SELECT COUNT(*) FROM trade_executions WHERE status = 'pending'"
             ) or 0
             await conn.execute(
                 """
                 UPDATE trade_executions
-                SET status = 'failed',
-                    error  = COALESCE(error, 'cleared by /pipelines/reset')
+                SET status      = 'cancelled',
+                    mt5_comment = COALESCE(mt5_comment, '') ||
+                                  CASE WHEN mt5_comment IS NULL OR mt5_comment = ''
+                                       THEN 'cleared by /pipelines/reset'
+                                       ELSE ' | cleared by /pipelines/reset'
+                                  END
                 WHERE status = 'pending'
                 """
             )
@@ -314,37 +399,41 @@ async def reset_pipeline_state(
 
 # ── Background runner ─────────────────────────────────────────────────────────
 
-async def _run_pipeline(pool, source: str) -> None:
-    """Generate signals for a single source on the tracked-ticker set.
+async def _run_pipeline_inner(pool, source: str) -> int:
+    """Inner implementation — runs the pipeline, returns signals_count.
 
     Imports the heavy services inline to avoid pulling them at module-import
-    time (which would slow down startup for every other route)."""
+    time (which would slow down startup for every other route). Raises on
+    any failure; the wrappers below handle persistence of last_error."""
     from app.core.asset_class import is_fx
     from app.services.signal_service import SignalService
     from app.services.ohlcv_service import OHLCVService
     from app.strategies.donchian import DonchianService
 
-    try:
-        ohlcv = OHLCVService(pool)
-        all_tickers = await ohlcv.get_available_tickers() or []
-        if source == "ml_equities":
-            tickers = [t for t in all_tickers if not is_fx(t)]
-            svc     = SignalService(pool)
-            results = await svc.generate_batch(tickers, "1d")
-            n = len(results)
-        elif source == "ml_fx":
-            tickers = [t for t in all_tickers if is_fx(t)]
-            svc     = SignalService(pool)
-            results = await svc.generate_batch(tickers, "1d")
-            n = len(results)
-        elif source == "rule_donchian":
-            tickers = [t for t in all_tickers if is_fx(t)]
-            donch   = DonchianService(pool)
-            results = await donch.generate_batch(tickers, "1d")
-            n = len(results)
-        else:
-            raise ValueError(f"no runner for source {source!r}")
+    ohlcv = OHLCVService(pool)
+    all_tickers = await ohlcv.get_available_tickers() or []
+    if source == "ml_equities":
+        tickers = [t for t in all_tickers if not is_fx(t)]
+        svc     = SignalService(pool)
+        results = await svc.generate_batch(tickers, "1d")
+    elif source == "ml_fx":
+        tickers = [t for t in all_tickers if is_fx(t)]
+        svc     = SignalService(pool)
+        results = await svc.generate_batch(tickers, "1d")
+    elif source == "rule_donchian":
+        tickers = [t for t in all_tickers if is_fx(t)]
+        donch   = DonchianService(pool)
+        results = await donch.generate_batch(tickers, "1d")
+    else:
+        raise ValueError(f"no runner for source {source!r}")
+    return len(results)
 
+
+async def _run_pipeline(pool, source: str) -> None:
+    """Background-task wrapper around _run_pipeline_inner. Catches and
+    records errors so a fire-and-forget BackgroundTask never explodes."""
+    try:
+        n = await _run_pipeline_inner(pool, source)
         await record_run(pool, source, signals_count=n, error=None)
         logger.info(f"✅ pipeline {source}: {n} signals generated")
     except Exception as e:
