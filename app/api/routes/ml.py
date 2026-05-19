@@ -366,23 +366,27 @@ async def get_drift_baseline(current_user=Depends(get_current_active_user)):
 # ── Model versioning ──────────────────────────────────────────────────────────
 
 @router.get("/versions")
-async def list_versions(current_user=Depends(get_current_active_user)):
-    """List all trained model versions, newest first."""
+async def list_versions(
+    asset_class: str = "equities",
+    current_user=Depends(get_current_active_user),
+):
+    """List all trained model versions for one asset class, newest first."""
     from app.ml.models.registry import list_versions as _list
-    return {"versions": _list()}
+    return {"versions": _list(asset_class)}
 
 
 @router.post("/versions/rollback")
 async def rollback_version(
     version: str,
+    asset_class: str = "equities",
     current_user=Depends(get_current_active_user),
 ):
     """
-    Promote a previous checkpoint to best_model.pt.
+    Promote a previous checkpoint to best_model.pt for the given asset class.
     Pass the checkpoint filename, e.g. model_20240315_143022.pt
     """
     from app.ml.models.registry import rollback_to
-    ok = rollback_to(version)
+    ok = rollback_to(version, asset_class)
     if not ok:
-        raise HTTPException(404, f"Checkpoint '{version}' not found in checkpoints/")
-    return {"message": f"Rolled back to {version}", "active": version}
+        raise HTTPException(404, f"Checkpoint '{version}' not found for {asset_class}")
+    return {"message": f"Rolled back {asset_class} to {version}", "active": version}

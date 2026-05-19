@@ -58,12 +58,16 @@ class ExecutionService:
 
     async def auto_execute(self, user_id: int) -> list[dict]:
         """
-        Execute all recent BUY/SELL signals that have not been executed yet
-        for users with auto_trade = TRUE.
+        Execute recent BUY/SELL signals that have not been executed yet for
+        users with auto_trade = TRUE.
 
-        Only takes signals that passed the model's filter chain (action != HOLD)
-        AND have a positive expected_value. Ordered by expected_value desc so
-        the strongest setups go first when max_open_positions is close to limit.
+        **Round-robin allocation across pipelines.** A signal's source
+        (`ml_equities`, `ml_fx`, `rule_donchian`) determines its queue, and
+        we take one from each non-empty queue in rotation. This guarantees
+        every pipeline gets representation when slots are scarce instead of
+        the dominant-EV pipeline monopolising every slot. Within each queue
+        the highest-EV signal still wins, so quality inside a pipeline is
+        preserved. Sources with no actionable signals are skipped silently.
 
         Called by the scheduler after each signal regeneration cycle.
         """
@@ -73,7 +77,8 @@ class ExecutionService:
 
         # Signals from the last 24 hours that haven't been successfully filled.
         # NULL expected_value is treated as 0 so legacy rows still pass when
-        # min_expected_value is at its default 0.0.
+        # min_expected_value is at its default 0.0. We order within each source
+        # queue by EV desc so round-robin picks the best one per pipeline first.
         async with self.pool.acquire() as conn:
             signals = await conn.fetch(
                 """
@@ -88,20 +93,57 @@ class ExecutionService:
                         AND te.user_id = $2
                         AND te.status IN ('filled', 'pending')
                   )
-                ORDER BY COALESCE(s.expected_value, 0) DESC, s.confidence DESC
+                ORDER BY COALESCE(s.source, 'ml_equities'),
+                         COALESCE(s.expected_value, 0) DESC,
+                         s.confidence DESC
                 """,
                 config["min_confidence"],
                 user_id,
             )
 
+        # ── Bucket by source, then interleave round-robin ────────────────────
+        # Each bucket is already EV-sorted by the SQL ORDER BY above. We pop
+        # from the front of each bucket in turn; when a bucket empties it
+        # falls out of the rotation naturally.
+        buckets: dict[str, list[dict]] = {}
+        for row in signals:
+            src = row.get("source") or "ml_equities"
+            buckets.setdefault(src, []).append(dict(row))
+
+        # Stable source order so the rotation is deterministic across runs
+        # (helps debugging: trade #1 is always Equities ML, #2 FX ML, etc.)
+        source_order = ["ml_equities", "ml_fx", "rule_donchian"]
+        active = [s for s in source_order if buckets.get(s)] + [
+            s for s in buckets if s not in source_order   # any unexpected source
+        ]
+
+        ordered: list[dict] = []
+        while active:
+            for src in list(active):
+                if buckets[src]:
+                    ordered.append(buckets[src].pop(0))
+                if not buckets[src]:
+                    active.remove(src)
+
+        if ordered:
+            tally = {s: 0 for s in source_order}
+            for sig in ordered:
+                tally[sig.get("source") or "ml_equities"] = tally.get(
+                    sig.get("source") or "ml_equities", 0) + 1
+            logger.info(
+                f"Auto-execute queue (round-robin): "
+                f"{', '.join(f'{k}={v}' for k, v in tally.items() if v)} — "
+                f"will place in pipeline-interleaved order"
+            )
+
         results = []
-        for signal in signals:
-            result = await self._place_for_signal(dict(signal), config, user_id)
+        for signal in ordered:
+            result = await self._place_for_signal(signal, config, user_id)
             results.append(result)
             if not result["ok"]:
                 logger.warning(
-                    f"Auto-execute skipped signal {signal['id']} for user {user_id}: "
-                    f"{result.get('error')}"
+                    f"Auto-execute skipped signal {signal['id']} ({signal.get('source')}) "
+                    f"for user {user_id}: {result.get('error')}"
                 )
 
         return results

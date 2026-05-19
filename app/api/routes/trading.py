@@ -275,9 +275,55 @@ async def run_now(
     if not valid_tickers:
         raise HTTPException(400, "None of your tracked tickers are available on this MT5 broker")
 
-    # 3. Regenerate signals only for broker-valid tickers
+    # 3. Regenerate signals across all three pipelines on broker-valid tickers.
+    # ML covers equities + FX (auto-routed by SignalService). Donchian is FX-only
+    # so we filter the valid set by is_fx before invoking it. Both pipelines
+    # respect their pipeline_config.enabled flag — disabled strategies are
+    # skipped silently and their `last_run_at` is not updated.
+    from app.core.asset_class import is_fx
+    from app.strategies.donchian import DonchianService
+    from app.api.routes.pipelines import get_enabled_sources, record_run
+
+    enabled = await get_enabled_sources(pool)
     signal_svc = SignalService(pool)
-    signals = await signal_svc.generate_batch(valid_tickers, "1d")
+    ml_signals: list[dict] = []
+    donchian_signals: list[dict] = []
+
+    # ── ML (equities + FX) ────────────────────────────────────────────────────
+    if "ml_equities" in enabled or "ml_fx" in enabled:
+        try:
+            ml_signals = await signal_svc.generate_batch(valid_tickers, "1d")
+            # record_run is per-source, but generate_batch produces both ml_equities
+            # and ml_fx in one pass. Tally by source so each card on /strategies
+            # gets its own last_signals_count update.
+            eq_count = sum(1 for s in ml_signals if s.get("source") == "ml_equities")
+            fx_count = sum(1 for s in ml_signals if s.get("source") == "ml_fx")
+            if "ml_equities" in enabled:
+                await record_run(pool, "ml_equities", signals_count=eq_count)
+            if "ml_fx" in enabled:
+                await record_run(pool, "ml_fx", signals_count=fx_count)
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            logger.error(f"ML batch failed during run-now: {err}")
+            if "ml_equities" in enabled:
+                await record_run(pool, "ml_equities", error=err)
+            if "ml_fx" in enabled:
+                await record_run(pool, "ml_fx", error=err)
+
+    # ── Donchian rule (FX only) ───────────────────────────────────────────────
+    if "rule_donchian" in enabled:
+        fx_valid = [t for t in valid_tickers if is_fx(t)]
+        if fx_valid:
+            try:
+                donchian = DonchianService(pool)
+                donchian_signals = await donchian.generate_batch(fx_valid, "1d")
+                await record_run(pool, "rule_donchian", signals_count=len(donchian_signals))
+            except Exception as e:
+                err = f"{type(e).__name__}: {e}"
+                logger.error(f"Donchian batch failed during run-now: {err}")
+                await record_run(pool, "rule_donchian", error=err)
+
+    signals = ml_signals + donchian_signals
 
     # Diagnostic breakdown of the new profit-filter gates: how many signals
     # were downgraded to HOLD and the reasons. Surfaced to the UI so users
@@ -291,7 +337,14 @@ async def run_now(
             key = (r.split("=")[0] if "=" in r else r.split("<")[0]).strip()
             reason_counts[key] = reason_counts.get(key, 0) + 1
 
-    # 4. Auto-execute new signals
+    # Per-source counts so the toast can show "12 Equities ML, 4 FX ML, 2 Donchian"
+    per_source_counts: dict[str, int] = {}
+    for s in signals:
+        src = s.get("source") or "ml_equities"
+        per_source_counts[src] = per_source_counts.get(src, 0) + 1
+
+    # 4. Auto-execute new signals (across all three sources — auto_execute reads
+    # the signals table and ranks BUY/SELL rows by EV regardless of source).
     results = await exec_svc.auto_execute(current_user["id"])
     filled = [r for r in results if r.get("ok")]
     failed = [r for r in results if not r.get("ok")]
@@ -304,6 +357,7 @@ async def run_now(
         "signals_generated":  len(signals),
         "signals_actionable": len(actionable),
         "signals_filtered":   len(filtered_hold),
+        "signals_by_source":  per_source_counts,
         "filter_breakdown":   reason_counts,
         "total_expected_value": round(total_ev, 6),
         "orders_attempted":   len(results),
