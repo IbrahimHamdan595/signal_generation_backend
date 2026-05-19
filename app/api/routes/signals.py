@@ -1,10 +1,14 @@
+import logging
+
 from fastapi import APIRouter, HTTPException, Depends, Query, BackgroundTasks, Request
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 from typing import List
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from app.core.security import get_current_active_user
+
+logger = logging.getLogger(__name__)
 
 limiter = Limiter(key_func=get_remote_address)
 from app.db.database import get_db
@@ -21,6 +25,10 @@ router = APIRouter(prefix="/signals", tags=["Trading Signals"])
 
 
 def _to_response(doc: dict) -> SignalResponse:
+    # `dict.get(key, default)` returns the default only when the key is missing,
+    # not when the value is None. After migration 0015 some old rows can still
+    # carry source=NULL, so we collapse falsy values to the equities default.
+    src = doc.get("source") or "ml_equities"
     return SignalResponse(
         id=str(doc.get("id", "")),
         ticker=doc["ticker"],
@@ -41,9 +49,27 @@ def _to_response(doc: dict) -> SignalResponse:
         prob_buy=doc.get("prob_buy"),
         prob_sell=doc.get("prob_sell"),
         prob_hold=doc.get("prob_hold"),
-        source=doc.get("source", "ml_equities"),
+        source=src,
         created_at=doc.get("created_at"),
     )
+
+
+def _safe_to_response_list(docs: list[dict]) -> List[SignalResponse]:
+    """Serialize rows one by one, skipping any that fail validation.
+
+    A single malformed row (e.g. created_at=NULL after a manual DB poke,
+    or an unexpected action value) should not 500 the whole list endpoint.
+    """
+    out: List[SignalResponse] = []
+    for d in docs:
+        try:
+            out.append(_to_response(d))
+        except (ValidationError, KeyError, TypeError) as e:
+            logger.warning(
+                f"signals: skipping malformed row id={d.get('id')} "
+                f"ticker={d.get('ticker')} source={d.get('source')}: {e}"
+            )
+    return out
 
 
 def _check_model():
@@ -61,7 +87,7 @@ async def list_signals(
     """List latest signals from all tickers"""
     svc = SignalService(pool)
     docs = await svc.get_all_latest()
-    return [_to_response(d) for d in docs]
+    return _safe_to_response_list(docs)
 
 
 @router.post("/generate", response_model=SignalResponse)
@@ -145,7 +171,7 @@ async def get_history(
     docs = await svc.get_history(ticker.upper(), interval, limit)
     if not docs:
         raise HTTPException(404, f"No signal history for {ticker.upper()}")
-    return [_to_response(d) for d in docs]
+    return _safe_to_response_list(docs)
 
 
 @router.get("/all/latest", response_model=List[SignalResponse])
@@ -155,7 +181,7 @@ async def get_all_latest(
 ):
     svc = SignalService(pool)
     docs = await svc.get_all_latest()
-    return [_to_response(d) for d in docs]
+    return _safe_to_response_list(docs)
 
 
 @router.get("/filter/action/{action}", response_model=List[SignalResponse])
@@ -170,7 +196,7 @@ async def get_by_action(
         raise HTTPException(400, "action must be BUY, SELL, or HOLD")
     svc = SignalService(pool)
     docs = await svc.get_by_action(action, interval, limit)
-    return [_to_response(d) for d in docs]
+    return _safe_to_response_list(docs)
 
 
 @router.get("/filter/high-confidence", response_model=List[SignalResponse])
@@ -183,7 +209,7 @@ async def get_high_confidence(
 ):
     svc = SignalService(pool)
     docs = await svc.get_high_confidence(min_confidence, interval, limit)
-    return [_to_response(d) for d in docs]
+    return _safe_to_response_list(docs)
 
 
 class TickerListOverrideRequest(BaseModel):
