@@ -1,3 +1,4 @@
+import asyncio
 import numpy as np
 import pandas as pd
 from typing import List, Optional, Tuple
@@ -10,6 +11,21 @@ from app.core.asset_class import is_fx
 logger = logging.getLogger(__name__)
 
 OHLCV_COLS = ["open", "high", "low", "close", "volume"]
+
+# Cap dataset history to keep row counts manageable. Metals on yfinance carry
+# 25+ years of daily bars and 4h tables exceed 30k rows for active FX pairs;
+# pulling all of it across the network is what was tripping the cloud DB
+# connection pooler ("connection was closed in the middle of operation").
+# 15 years of daily bars is ~3,750 rows per ticker — plenty for training, and
+# anything older is from a different macro regime anyway.
+MAX_HISTORY_YEARS = 15
+
+# Retry the dataset fetch on transient pooler disconnects. asyncpg's
+# PostgresConnectionError / InterfaceError signature for the cloud-pooler kill
+# is "connection was closed in the middle of operation" — those are spurious,
+# the next acquire opens a fresh socket.
+DB_RETRY_ATTEMPTS = 2
+DB_RETRY_BASE_DELAY = 0.5
 
 # Columns fetched from the indicators table. Some of these are kept for
 # transformation (cyclical encoding) and not exposed directly to the model.
@@ -188,6 +204,41 @@ class DatasetBuilder:
     def __init__(self, pool: asyncpg.Pool):
         self.pool = pool
 
+    async def _fetch(self, query: str, *args, fetchrow: bool = False):
+        """Run a SELECT with retry on transient pooler disconnects.
+
+        Wraps a single `pool.acquire() + conn.fetch/fetchrow` round-trip. On
+        the cloud-pooler "connection was closed in the middle of operation"
+        signature, sleeps briefly then re-acquires a fresh connection. After
+        DB_RETRY_ATTEMPTS the last exception is re-raised so callers see the
+        underlying failure rather than a silent empty result.
+        """
+        last_err: Optional[Exception] = None
+        for attempt in range(DB_RETRY_ATTEMPTS + 1):
+            try:
+                async with self.pool.acquire() as conn:
+                    if fetchrow:
+                        return await conn.fetchrow(query, *args)
+                    return await conn.fetch(query, *args)
+            except (
+                asyncpg.PostgresConnectionError,
+                asyncpg.InterfaceError,
+                ConnectionResetError,
+                OSError,
+            ) as e:
+                last_err = e
+                if attempt < DB_RETRY_ATTEMPTS:
+                    delay = DB_RETRY_BASE_DELAY * (attempt + 1)
+                    logger.warning(
+                        f"DB connection dropped (attempt {attempt + 1}/{DB_RETRY_ATTEMPTS + 1}): "
+                        f"{type(e).__name__}: {e} — retrying in {delay:.1f}s"
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+        # Out of retries
+        assert last_err is not None
+        raise last_err
+
     async def build(
         self,
         tickers: List[str],
@@ -260,58 +311,61 @@ class DatasetBuilder:
         FX-ML fix. `buy_thresh`/`sell_thresh` then serve only as a fallback
         floor for bars where ATR is missing/zero.
         """
-        async with self.pool.acquire() as conn:
-            ohlcv_rows = await conn.fetch(
-                """
-                SELECT open, high, low, close, volume, timestamp
-                FROM ohlcv_data
-                WHERE ticker = $1 AND interval = $2
-                ORDER BY timestamp ASC
-                """,
-                ticker,
-                interval,
-            )
+        # Cap history to MAX_HISTORY_YEARS. Metals/FX have 25+ years on
+        # yfinance and pulling that across a cloud DB pooler is what was
+        # producing the "connection was closed in the middle of operation"
+        # failures. Older bars are from a different macro regime anyway.
+        ohlcv_rows = await self._fetch(
+            f"""
+            SELECT open, high, low, close, volume, timestamp
+            FROM ohlcv_data
+            WHERE ticker = $1 AND interval = $2
+              AND timestamp >= NOW() - INTERVAL '{MAX_HISTORY_YEARS} years'
+            ORDER BY timestamp ASC
+            """,
+            ticker,
+            interval,
+        )
 
         if len(ohlcv_rows) < sequence_len + settings.LOOKAHEAD_WINDOW + 1:
             logger.warning(f"⚠️  {ticker}: not enough rows ({len(ohlcv_rows)})")
             return None, None, None, None, None
 
-        async with self.pool.acquire() as conn:
-            ind_rows = await conn.fetch(
-                """
-                SELECT timestamp, """
-                + ", ".join(DB_INDICATOR_COLS)
-                + """
-                FROM indicators
-                WHERE ticker = $1 AND interval = $2
-                ORDER BY timestamp ASC
-                """,
-                ticker,
-                interval,
-            )
+        ind_rows = await self._fetch(
+            f"""
+            SELECT timestamp, {", ".join(DB_INDICATOR_COLS)}
+            FROM indicators
+            WHERE ticker = $1 AND interval = $2
+              AND timestamp >= NOW() - INTERVAL '{MAX_HISTORY_YEARS} years'
+            ORDER BY timestamp ASC
+            """,
+            ticker,
+            interval,
+        )
 
-            # Per-day sentiment from daily_sentiment table (Finnhub + FinBERT)
-            daily_sent_rows = await conn.fetch(
-                """
-                SELECT date, avg_positive, avg_negative, avg_neutral, avg_compound
-                FROM daily_sentiment
-                WHERE ticker = $1
-                ORDER BY date ASC
-                """,
-                ticker,
-            )
+        # Per-day sentiment from daily_sentiment table (Finnhub + FinBERT)
+        daily_sent_rows = await self._fetch(
+            """
+            SELECT date, avg_positive, avg_negative, avg_neutral, avg_compound
+            FROM daily_sentiment
+            WHERE ticker = $1
+            ORDER BY date ASC
+            """,
+            ticker,
+        )
 
-            # Global snapshot as fallback
-            sent_row = await conn.fetchrow(
-                """
-                SELECT avg_positive, avg_negative, avg_neutral, avg_compound
-                FROM sentiment_snapshots
-                WHERE ticker = $1
-                ORDER BY computed_at DESC
-                LIMIT 1
-                """,
-                ticker,
-            )
+        # Global snapshot as fallback
+        sent_row = await self._fetch(
+            """
+            SELECT avg_positive, avg_negative, avg_neutral, avg_compound
+            FROM sentiment_snapshots
+            WHERE ticker = $1
+            ORDER BY computed_at DESC
+            LIMIT 1
+            """,
+            ticker,
+            fetchrow=True,
+        )
 
         df_ohlcv = pd.DataFrame([dict(r) for r in ohlcv_rows])[
             ["timestamp"] + OHLCV_COLS
@@ -336,14 +390,14 @@ class DatasetBuilder:
         # trained on 51 features, not 54.
         ticker_is_fx = is_fx(ticker)
         if ticker_is_fx:
-            async with self.pool.acquire() as conn:
-                macro_rows = await conn.fetch(
-                    """
-                    SELECT date, dxy_ret_5d, vix_close, yield_spread_10_2, us_2y_yield
-                    FROM fx_macro_features
-                    ORDER BY date ASC
-                    """
-                )
+            macro_rows = await self._fetch(
+                f"""
+                SELECT date, dxy_ret_5d, vix_close, yield_spread_10_2, us_2y_yield
+                FROM fx_macro_features
+                WHERE date >= (NOW() - INTERVAL '{MAX_HISTORY_YEARS} years')::date
+                ORDER BY date ASC
+                """
+            )
             if macro_rows:
                 df_macro = pd.DataFrame([dict(r) for r in macro_rows])
                 # Normalise both join keys to tz-naive datetime64[ns] at
@@ -384,16 +438,16 @@ class DatasetBuilder:
             # history, so older daily samples will have NaNs here — they get
             # zero-padded by the model's nan_to_num path, equivalent to "no
             # MTF context".
-            async with self.pool.acquire() as conn:
-                rows_4h = await conn.fetch(
-                    """
-                    SELECT timestamp, rsi_14, macd_histogram, atr_14, roc_5
-                    FROM indicators
-                    WHERE ticker = $1 AND interval = '4h'
-                    ORDER BY timestamp ASC
-                    """,
-                    ticker,
-                )
+            rows_4h = await self._fetch(
+                f"""
+                SELECT timestamp, rsi_14, macd_histogram, atr_14, roc_5
+                FROM indicators
+                WHERE ticker = $1 AND interval = '4h'
+                  AND timestamp >= NOW() - INTERVAL '{MAX_HISTORY_YEARS} years'
+                ORDER BY timestamp ASC
+                """,
+                ticker,
+            )
             if rows_4h:
                 df_4h = pd.DataFrame([dict(r) for r in rows_4h]).rename(columns={
                     "rsi_14":          "rsi_14_4h",

@@ -1,9 +1,10 @@
+import math
 import os
 from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks, Request
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from app.core.security import get_current_active_user
 
@@ -15,6 +16,24 @@ from app.ml.models.registry import is_model_trained
 from app.ml.data.dataset import SEQUENCE_LEN
 
 router = APIRouter(prefix="/ml", tags=["ML Model"])
+
+
+def _sanitize_json(obj: Any) -> Any:
+    """Recursively replace NaN/Inf floats with None so FastAPI can serialize.
+
+    Python's `json.load` happily parses `NaN`/`Infinity` literals into floats,
+    but the default `json.dumps` rejects them with
+    `ValueError: Out of range float values are not JSON compliant`. Training
+    code can emit NaN for undefined metrics (zero-variance Sharpe, regression
+    on a single-class fold, etc.), so we coerce them to None before returning.
+    """
+    if isinstance(obj, float):
+        return None if (math.isnan(obj) or math.isinf(obj)) else obj
+    if isinstance(obj, dict):
+        return {k: _sanitize_json(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_json(v) for v in obj]
+    return obj
 
 
 class TrainRequest(BaseModel):
@@ -239,7 +258,7 @@ async def get_eval_report(
     if not os.path.exists(path):
         raise HTTPException(404, f"No evaluation report for {ac}. Train the model first.")
     with open(path) as f:
-        return json.load(f)
+        return _sanitize_json(json.load(f))
 
 
 @router.get("/train/result")
@@ -256,7 +275,7 @@ async def get_last_train_result(
     if not os.path.exists(path):
         raise HTTPException(404, f"No training result for {ac} yet.")
     with open(path) as f:
-        return json.load(f)
+        return _sanitize_json(json.load(f))
 
 
 # ── Walk-forward validation ───────────────────────────────────────────────────
@@ -318,7 +337,7 @@ async def get_walkforward_result(current_user=Depends(get_current_active_user)):
     if not os.path.exists(path):
         raise HTTPException(404, "No walk-forward result yet. Run POST /ml/walkforward first.")
     with open(path) as f:
-        return json.load(f)
+        return _sanitize_json(json.load(f))
 
 
 # ── Drift monitoring ──────────────────────────────────────────────────────────
