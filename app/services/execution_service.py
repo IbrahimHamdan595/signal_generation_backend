@@ -61,24 +61,53 @@ class ExecutionService:
         Execute recent BUY/SELL signals that have not been executed yet for
         users with auto_trade = TRUE.
 
-        **Round-robin allocation across pipelines.** A signal's source
-        (`ml_equities`, `ml_fx`, `rule_donchian`) determines its queue, and
-        we take one from each non-empty queue in rotation. This guarantees
-        every pipeline gets representation when slots are scarce instead of
-        the dominant-EV pipeline monopolising every slot. Within each queue
-        the highest-EV signal still wins, so quality inside a pipeline is
-        preserved. Sources with no actionable signals are skipped silently.
+        **Per-pipeline quota allocation with redistribute.** Slots are divided
+        evenly across enabled pipelines that have actionable signals:
 
-        Called by the scheduler after each signal regeneration cycle.
+            quota = (max_open_positions - currently_open) // n_active_pipelines
+
+        Each pipeline first takes its top-`quota` signals ranked by confidence
+        DESC (EV DESC tiebreak). Any leftover capacity — integer-division
+        remainder plus unused quota from pipelines that ran short — is then
+        redistributed round-robin to pipelines that still have signals. So
+        with max=12 and three pipelines producing 8/2/9 actionable signals,
+        the split is 5/2/5 rather than 4/2/4.
+
+        Trades are placed in interleaved order (1 from pipe-A, 1 from pipe-B,
+        …) so a partial-fill abort still leaves a balanced mix.
+
+        Called by `/trading/run-now` (Generate & Trade) and the hourly :15
+        scheduler tick — both paths share this policy.
         """
         config = await self._get_config(user_id)
         if not config or not config["enabled"] or not config["auto_trade"]:
             return []
 
+        # ── How many slots can we still open? ─────────────────────────────────
+        # Computed up-front so the quota divides the *remaining* capacity,
+        # not the total. `_place_for_signal` still re-checks per trade for
+        # late-arriving positions.
+        try:
+            mt5_positions = (
+                await self.broker.get_open_positions()
+                if await self.broker.is_connected()
+                else []
+            )
+        except Exception as e:
+            logger.warning(f"Auto-execute: could not read MT5 positions ({e}), assuming 0 open")
+            mt5_positions = []
+        slots_remaining = max(0, int(config["max_open_positions"]) - len(mt5_positions))
+        if slots_remaining == 0:
+            logger.info(
+                f"Auto-execute: max_open_positions ({config['max_open_positions']}) "
+                f"already reached, nothing to do"
+            )
+            return []
+
         # Signals from the last 24 hours that haven't been successfully filled.
-        # NULL expected_value is treated as 0 so legacy rows still pass when
-        # min_expected_value is at its default 0.0. We order within each source
-        # queue by EV desc so round-robin picks the best one per pipeline first.
+        # Ordered confidence-first so each pipeline's top-conf signals win its
+        # quota; EV is the tiebreak so Donchian's fixed-confidence rows still
+        # order sensibly.
         async with self.pool.acquire() as conn:
             signals = await conn.fetch(
                 """
@@ -94,46 +123,72 @@ class ExecutionService:
                         AND te.status IN ('filled', 'pending')
                   )
                 ORDER BY COALESCE(s.source, 'ml_equities'),
-                         COALESCE(s.expected_value, 0) DESC,
-                         s.confidence DESC
+                         s.confidence DESC,
+                         COALESCE(s.expected_value, 0) DESC
                 """,
                 config["min_confidence"],
                 user_id,
             )
 
-        # ── Bucket by source, then interleave round-robin ────────────────────
-        # Each bucket is already EV-sorted by the SQL ORDER BY above. We pop
-        # from the front of each bucket in turn; when a bucket empties it
-        # falls out of the rotation naturally.
+        # Bucket by source. The SQL above already orders each bucket
+        # confidence-DESC then EV-DESC, so simple list slicing picks top-N.
         buckets: dict[str, list[dict]] = {}
         for row in signals:
             src = row.get("source") or "ml_equities"
             buckets.setdefault(src, []).append(dict(row))
 
-        # Stable source order so the rotation is deterministic across runs
-        # (helps debugging: trade #1 is always Equities ML, #2 FX ML, etc.)
-        source_order = ["ml_equities", "ml_fx", "rule_donchian"]
-        active = [s for s in source_order if buckets.get(s)] + [
-            s for s in buckets if s not in source_order   # any unexpected source
+        # Stable source order keeps placements deterministic across runs.
+        SOURCE_ORDER = ["ml_equities", "ml_fx", "rule_donchian"]
+        active = [s for s in SOURCE_ORDER if buckets.get(s)] + [
+            s for s in buckets if s not in SOURCE_ORDER   # any unexpected source
         ]
+        n_active = len(active)
+        if n_active == 0:
+            return []
 
-        ordered: list[dict] = []
-        while active:
-            for src in list(active):
+        quota = slots_remaining // n_active
+        selected_by_src: dict[str, list[dict]] = {s: [] for s in active}
+
+        # Phase 1 — each pipeline takes its quota (or fewer if it ran short).
+        for src in active:
+            take = min(quota, len(buckets[src]))
+            selected_by_src[src] = buckets[src][:take]
+            buckets[src] = buckets[src][take:]
+
+        # Phase 2 — distribute the remainder + any unused-quota slots in
+        # round-robin from pipelines that still have signals. A pipeline that
+        # produced fewer signals than its quota gives its leftover slots to
+        # others, so e.g. 12 slots / 3 pipelines with 2/8/9 actionable becomes
+        # 2/5/5 rather than 2/4/4.
+        spare = slots_remaining - sum(len(v) for v in selected_by_src.values())
+        while spare > 0:
+            progressed = False
+            for src in active:
+                if spare <= 0:
+                    break
                 if buckets[src]:
-                    ordered.append(buckets[src].pop(0))
-                if not buckets[src]:
-                    active.remove(src)
+                    selected_by_src[src].append(buckets[src].pop(0))
+                    spare -= 1
+                    progressed = True
+            if not progressed:
+                break  # no pipeline has any more signals
+
+        # Interleave for placement: trade #1 from pipe-A, #2 from pipe-B, etc.
+        # If the loop aborts early (late-arriving position fills max_open
+        # mid-flight) the executed trades still keep a balanced pipeline mix.
+        ordered: list[dict] = []
+        queues = {s: list(selected_by_src[s]) for s in active}
+        while any(queues.values()):
+            for src in active:
+                if queues[src]:
+                    ordered.append(queues[src].pop(0))
 
         if ordered:
-            tally = {s: 0 for s in source_order}
-            for sig in ordered:
-                tally[sig.get("source") or "ml_equities"] = tally.get(
-                    sig.get("source") or "ml_equities", 0) + 1
+            tally = {s: len(selected_by_src[s]) for s in active}
             logger.info(
-                f"Auto-execute queue (round-robin): "
-                f"{', '.join(f'{k}={v}' for k, v in tally.items() if v)} — "
-                f"will place in pipeline-interleaved order"
+                f"Auto-execute (per-pipeline quota): slots={slots_remaining} "
+                f"n_pipelines={n_active} quota={quota} -> "
+                f"{', '.join(f'{k}={v}' for k, v in tally.items())}"
             )
 
         results = []
