@@ -275,55 +275,47 @@ async def run_now(
     if not valid_tickers:
         raise HTTPException(400, "None of your tracked tickers are available on this MT5 broker")
 
-    # 3. Regenerate signals across all three pipelines on broker-valid tickers.
-    # ML covers equities + FX (auto-routed by SignalService). Donchian is FX-only
-    # so we filter the valid set by is_fx before invoking it. Both pipelines
-    # respect their pipeline_config.enabled flag — disabled strategies are
-    # skipped silently and their `last_run_at` is not updated.
-    from app.core.asset_class import is_fx
-    from app.strategies.donchian import DonchianService
-    from app.api.routes.pipelines import get_enabled_sources, record_run
+    # 3. Regenerate signals across every enabled pipeline on the broker-valid
+    # universe. _run_pipeline_inner handles asset-class filtering (equities vs
+    # FX) and routes ML calls to the right checkpoint (daily vs 1h). Disabled
+    # pipelines are skipped silently and their last_run_at is not updated.
+    from app.api.routes.pipelines import (
+        get_enabled_sources, record_run, _run_pipeline_inner, SOURCE_META,
+    )
 
     enabled = await get_enabled_sources(pool)
-    signal_svc = SignalService(pool)
-    ml_signals: list[dict] = []
-    donchian_signals: list[dict] = []
-
-    # ── ML (equities + FX) ────────────────────────────────────────────────────
-    if "ml_equities" in enabled or "ml_fx" in enabled:
+    # Re-read the latest signals after each pipeline so we can tally per-source.
+    pipeline_results: dict[str, dict] = {}
+    for src in sorted(enabled):
+        if src not in SOURCE_META:
+            continue
         try:
-            ml_signals = await signal_svc.generate_batch(valid_tickers, "1d")
-            # record_run is per-source, but generate_batch produces both ml_equities
-            # and ml_fx in one pass. Tally by source so each card on /strategies
-            # gets its own last_signals_count update.
-            eq_count = sum(1 for s in ml_signals if s.get("source") == "ml_equities")
-            fx_count = sum(1 for s in ml_signals if s.get("source") == "ml_fx")
-            if "ml_equities" in enabled:
-                await record_run(pool, "ml_equities", signals_count=eq_count)
-            if "ml_fx" in enabled:
-                await record_run(pool, "ml_fx", signals_count=fx_count)
+            n = await _run_pipeline_inner(pool, src, tickers=valid_tickers)
+            await record_run(pool, src, signals_count=n, error=None)
+            pipeline_results[src] = {"signals_generated": n, "ok": True}
+            logger.info(f"✅ pipeline {src}: {n} signals generated")
         except Exception as e:
             err = f"{type(e).__name__}: {e}"
-            logger.error(f"ML batch failed during run-now: {err}")
-            if "ml_equities" in enabled:
-                await record_run(pool, "ml_equities", error=err)
-            if "ml_fx" in enabled:
-                await record_run(pool, "ml_fx", error=err)
-
-    # ── Donchian rule (FX only) ───────────────────────────────────────────────
-    if "rule_donchian" in enabled:
-        fx_valid = [t for t in valid_tickers if is_fx(t)]
-        if fx_valid:
             try:
-                donchian = DonchianService(pool)
-                donchian_signals = await donchian.generate_batch(fx_valid, "1d")
-                await record_run(pool, "rule_donchian", signals_count=len(donchian_signals))
-            except Exception as e:
-                err = f"{type(e).__name__}: {e}"
-                logger.error(f"Donchian batch failed during run-now: {err}")
-                await record_run(pool, "rule_donchian", error=err)
+                await record_run(pool, src, signals_count=None, error=err)
+            except Exception:
+                pass
+            pipeline_results[src] = {"signals_generated": 0, "ok": False, "error": err}
+            logger.error(f"❌ pipeline {src} failed: {err}")
 
-    signals = ml_signals + donchian_signals
+    # Pull the just-generated signals back from the DB so the per-source
+    # breakdown and filter-reason tally stay accurate. We use the last
+    # ~5 minutes window — generous enough for slow runs, narrow enough to
+    # avoid mixing in stale rows from the previous scheduler tick.
+    async with pool.acquire() as conn:
+        signal_rows = await conn.fetch(
+            """
+            SELECT source, action, expected_value, reject_reasons
+            FROM signals
+            WHERE created_at >= NOW() - INTERVAL '5 minutes'
+            """
+        )
+    signals = [dict(r) for r in signal_rows]
 
     # Diagnostic breakdown of the new profit-filter gates: how many signals
     # were downgraded to HOLD and the reasons. Surfaced to the UI so users

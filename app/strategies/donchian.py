@@ -47,10 +47,24 @@ _RULE_EXPECTED_VAL = 0.0075   # = 0.55*1.5% - 0.45*1.0%  ≈ +75 bps prior
 
 
 class DonchianService:
-    """Generates BUY/SELL/HOLD signals from a 20-day Donchian breakout rule."""
+    """Generates BUY/SELL/HOLD signals from a 20-bar Donchian breakout rule.
 
-    def __init__(self, pool: asyncpg.Pool):
-        self.pool = pool
+    Same rule, two configurations:
+      - Default (interval='1d', source='rule_donchian')         → 20-day breakout
+      - Intraday (interval='1h', source='rule_donchian_1h')     → 20-hour breakout
+    ATR-based SL/TP scale automatically because they read the ATR row from
+    the same interval's indicators table.
+    """
+
+    def __init__(
+        self,
+        pool: asyncpg.Pool,
+        interval: str = "1d",
+        source_tag: str = SOURCE_TAG,
+    ):
+        self.pool       = pool
+        self.interval   = interval
+        self.source_tag = source_tag
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -153,7 +167,7 @@ class DonchianService:
             "channel_lower":  lower,
             "current_close":  current_close,
         }
-        return await self._persist(ticker, interval, result, source=SOURCE_TAG)
+        return await self._persist(ticker, interval, result, source=self.source_tag)
 
     async def generate_batch(
         self, tickers: List[str], interval: str = "1d",
@@ -246,4 +260,4 @@ class DonchianService:
             "channel_lower": current_close,
             "reject_reasons": reject_reasons or [],
         }
-        return await self._persist(ticker, interval, result, source=SOURCE_TAG)
+        return await self._persist(ticker, interval, result, source=self.source_tag)

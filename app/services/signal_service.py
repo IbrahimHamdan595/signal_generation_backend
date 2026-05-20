@@ -33,20 +33,54 @@ logger = logging.getLogger(__name__)
 
 
 class SignalService:
-    def __init__(self, pool: asyncpg.Pool):
+    def __init__(
+        self,
+        pool: asyncpg.Pool,
+        asset_class_override: Optional[str] = None,
+        source_override: Optional[str] = None,
+    ):
+        """
+        `asset_class_override` (e.g. "equities_1h", "fx_1h") forces the
+        ML inference to use a specific checkpoint folder regardless of the
+        ticker's natural asset class. Used by the 1h pipelines to route to
+        their own trained checkpoints.
+
+        `source_override` (e.g. "ml_equities_1h") overrides the `source` tag
+        written to the signals table. When None, the natural per-ticker
+        source ("ml_equities" / "ml_fx") is used.
+        """
         self.pool = pool
         self.ml_svc = MLService(pool)
+        self._ac_override     = asset_class_override
+        self._source_override = source_override
+
+    def _effective_asset_class(self, ticker: str) -> str:
+        """The checkpoint folder this service should hit for `ticker`."""
+        if self._ac_override:
+            return self._ac_override
+        return "fx" if _is_fx_ticker(ticker) else "equities"
+
+    def _effective_source_tag(self, ticker: str) -> str:
+        """The `source` column value to write to signals."""
+        if self._source_override:
+            return self._source_override
+        return "ml_fx" if _is_fx_ticker(ticker) else "ml_equities"
 
     async def generate_and_store(
         self, ticker: str, interval: str = "1d"
     ) -> Optional[dict]:
         ticker = ticker.upper()
 
-        if not is_model_trained():
-            logger.warning("⚠️  Signal requested but model not trained yet.")
+        # Class-aware trained check — ml_fx_1h shouldn't be blocked when
+        # equities isn't trained (and vice versa).
+        ac = self._effective_asset_class(ticker)
+        if not is_model_trained(ac):
+            logger.warning(f"⚠️  Signal requested but {ac} model not trained yet.")
             return None
 
-        result = await self.ml_svc.predict_ticker(ticker, interval)
+        result = await self.ml_svc.predict_ticker(
+            ticker, interval, asset_class_override=self._ac_override
+        )
 
         if "error" in result:
             logger.error(f"Signal error for {ticker}: {result['error']}")
@@ -151,7 +185,7 @@ class SignalService:
                 event_prox.get("cpi_days"),
                 event_prox.get("nfp_days"),
                 event_prox.get("earnings_days"),
-                "ml_equities" if not _is_fx_ticker(ticker) else "ml_fx",
+                self._effective_source_tag(ticker),
                 datetime.now(timezone.utc),
             )
 

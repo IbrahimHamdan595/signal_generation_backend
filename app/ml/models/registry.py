@@ -38,20 +38,27 @@ logger = logging.getLogger(__name__)
 # Root checkpoint directory — per-asset-class subfolders live underneath.
 CHECKPOINT_ROOT = "checkpoints"
 
-# Valid asset-class names map to subfolders of CHECKPOINT_ROOT.
-_VALID_ASSET_CLASSES = ("equities", "fx")
+# Valid asset-class names map to subfolders of CHECKPOINT_ROOT. The "_1h"
+# variants are intraday counterparts trained on 1h bars with shorter
+# lookahead — they live alongside the daily ones so both horizons can be
+# compared in the same forward-test.
+_VALID_ASSET_CLASSES = ("equities", "fx", "equities_1h", "fx_1h")
 
 
 def _normalize_asset_class(asset_class: str) -> str:
-    """Accepts 'equity'/'equities'/'fx_major'/'fx_metal'/'fx' and normalises
-    to one of the two checkpoint-folder names. Equity-side ingest emits
-    `asset_class_for(ticker) == 'equity'` (singular); training and registry
-    use the plural folder name."""
+    """Accepts 'equity'/'equities'/'fx_major'/'fx_metal'/'fx' and the new
+    intraday names 'equities_1h'/'fx_1h'. Normalises to a checkpoint-folder
+    name. Equity-side ingest emits `asset_class_for(ticker) == 'equity'`
+    (singular); training and registry use the plural folder name."""
     a = (asset_class or "").lower()
     if a in ("equity", "equities"):
         return "equities"
     if a in ("fx", "fx_major", "fx_metal"):
         return "fx"
+    if a == "equities_1h":
+        return "equities_1h"
+    if a == "fx_1h":
+        return "fx_1h"
     raise ValueError(f"Unknown asset_class={asset_class!r}; expected one of {_VALID_ASSET_CLASSES} (or equity/fx_major/fx_metal)")
 
 
@@ -70,9 +77,16 @@ def _paths_for(asset_class: str) -> dict:
     }
 
 
-# In-memory singletons per asset class.
-_model_instances: dict[str, Optional[TradingFusionModel]] = {"equities": None, "fx": None}
-_scaler_params:   dict[str, Optional[dict]]               = {"equities": None, "fx": None}
+# In-memory singletons per asset class. Initial slots for all four valid
+# classes so the daily and intraday models can be loaded simultaneously.
+_model_instances: dict[str, Optional[TradingFusionModel]] = {
+    "equities":    None, "fx":    None,
+    "equities_1h": None, "fx_1h": None,
+}
+_scaler_params:   dict[str, Optional[dict]]               = {
+    "equities":    None, "fx":    None,
+    "equities_1h": None, "fx_1h": None,
+}
 
 
 # ── Version management ────────────────────────────────────────────────────────

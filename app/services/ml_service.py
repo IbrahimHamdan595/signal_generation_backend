@@ -814,17 +814,23 @@ class MLService:
 
     # ── Single-ticker inference ───────────────────────────────────────────────
 
-    async def predict_ticker(self, ticker: str, interval: str = "1d") -> dict:
+    async def predict_ticker(
+        self, ticker: str, interval: str = "1d",
+        asset_class_override: Optional[str] = None,
+    ) -> dict:
         import json as _json
         from app.ml.models.registry import get_model, load_scaler_params, _paths_for
         from app.services.cache_service import get_cache
         from app.core.asset_class import asset_class_for
         from app.core.config import settings
 
-        # Route to the right model checkpoint based on the ticker's asset class.
-        # `asset_class_for` returns 'equity' / 'fx_major' / 'fx_metal'; the
-        # registry normalises those to 'equities' / 'fx' internally.
-        ac = asset_class_for(ticker)
+        # Route to the right model checkpoint. By default `asset_class_for`
+        # returns 'equity' / 'fx_major' / 'fx_metal' which the registry
+        # normalises to 'equities' / 'fx'. When `asset_class_override` is
+        # provided (e.g. "equities_1h", "fx_1h"), it bypasses the natural
+        # routing — used by the intraday pipelines to hit their own
+        # 1h-trained checkpoints regardless of ticker.
+        ac = asset_class_override or asset_class_for(ticker)
         paths = _paths_for(ac)
         config_path = paths["config"]
 

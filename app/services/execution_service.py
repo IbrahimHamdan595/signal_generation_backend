@@ -117,10 +117,20 @@ class ExecutionService:
                   AND COALESCE(s.expected_value, 0) > 0
                   AND s.created_at >= NOW() - INTERVAL '24 hours'
                   AND NOT EXISTS (
+                      -- Block re-trading any signal that has already been
+                      -- attempted to a *terminal* successful state. 'filled'
+                      -- and 'pending' are obvious; 'closed' means we already
+                      -- took our shot at this signal and the position has
+                      -- since exited (manual close, SL/TP hit, or reconciler
+                      -- noticed it gone). Re-opening would double-pay spread
+                      -- on the same model decision. 'cancelled' and 'error'
+                      -- stay retriable — those represent transient broker
+                      -- rejections (market closed, symbol unavailable) that
+                      -- should be picked up again on the next cycle.
                       SELECT 1 FROM trade_executions te
                       WHERE te.signal_id = s.id
                         AND te.user_id = $2
-                        AND te.status IN ('filled', 'pending')
+                        AND te.status IN ('filled', 'pending', 'closed')
                   )
                 ORDER BY COALESCE(s.source, 'ml_equities'),
                          s.confidence DESC,

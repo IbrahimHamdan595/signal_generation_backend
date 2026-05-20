@@ -29,11 +29,13 @@ async def lifespan(app: FastAPI):
     await connect_db()
     from app.services.storage_service import sync_from_cloud
     sync_from_cloud()
-    # Eagerly load both per-asset-class models so the first request doesn't
-    # pay the disk-read latency. Either may be absent (untrained) — `load_model`
-    # handles missing files gracefully.
-    load_model("equities")
-    load_model("fx")
+    # Eagerly load all per-asset-class models so the first request doesn't
+    # pay the disk-read latency. Any may be absent (untrained) — `load_model`
+    # handles missing files gracefully. The "_1h" variants are intraday
+    # counterparts; they stay None until trained, and `load_model` is a
+    # no-op when the checkpoint folder is empty.
+    for ac in ("equities", "fx", "equities_1h", "fx_1h"):
+        load_model(ac)
     start_scheduler()
     yield
     stop_scheduler()

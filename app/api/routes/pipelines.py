@@ -35,22 +35,53 @@ logger = logging.getLogger(__name__)
 
 
 # Display metadata for each source — kept in code (not DB) because it's UI-only
-# and won't ever vary per user.
+# and won't ever vary per user. The `interval` and `horizon` fields steer
+# `_run_pipeline_inner` (so adding a new pipeline only requires adding a row
+# here + an asset_class_override branch below).
 SOURCE_META: dict[str, dict[str, str]] = {
+    # ── Daily horizon (multi-day holds, 10-bar lookahead ML, 20-day Donchian) ──
     "ml_equities": {
         "display_name": "Equities ML",
         "description":  "Transformer+MLP model on S&P 500 equities (daily bars).",
         "kind":         "ml",
+        "interval":     "1d",
+        "horizon":      "daily",
     },
     "ml_fx": {
         "display_name": "FX ML",
         "description":  "Transformer+MLP model on FX/metal pairs (daily bars, vol-normalised labels).",
         "kind":         "ml",
+        "interval":     "1d",
+        "horizon":      "daily",
     },
     "rule_donchian": {
         "display_name": "FX Donchian (rule)",
         "description":  "Classic 20-day breakout, ATR-based stops. No ML.",
         "kind":         "rule",
+        "interval":     "1d",
+        "horizon":      "daily",
+    },
+    # ── Intraday horizon (~1-day holds, 6-bar lookahead ML, 20-hour Donchian) ──
+    "ml_equities_1h": {
+        "display_name": "Equities ML (1h)",
+        "description":  "Same architecture as Equities ML, retrained on 1h bars with 6-bar lookahead.",
+        "kind":         "ml",
+        "interval":     "1h",
+        "horizon":      "intraday",
+    },
+    "ml_fx_1h": {
+        "display_name": "FX ML (1h)",
+        "description":  "Same architecture as FX ML, retrained on 1h bars with 6-bar lookahead.",
+        "kind":         "ml",
+        "interval":     "1h",
+        "horizon":      "intraday",
+    },
+    "rule_donchian_1h": {
+        "display_name": "FX Donchian (1h)",
+        "description":  "20-hour breakout with 1h ATR stops. Intraday counterpart of Donchian (rule).",
+        "kind":         "rule",
+        "interval":     "1h",
+        "horizon":      "intraday",
     },
 }
 
@@ -441,31 +472,61 @@ async def reset_pipeline_state(
 
 # ── Background runner ─────────────────────────────────────────────────────────
 
-async def _run_pipeline_inner(pool, source: str) -> int:
+async def _run_pipeline_inner(
+    pool,
+    source: str,
+    tickers: Optional[list[str]] = None,
+) -> int:
     """Inner implementation — runs the pipeline, returns signals_count.
 
     Imports the heavy services inline to avoid pulling them at module-import
     time (which would slow down startup for every other route). Raises on
-    any failure; the wrappers below handle persistence of last_error."""
+    any failure; the wrappers below handle persistence of last_error.
+
+    The dispatch reads `SOURCE_META[source]['interval']` so adding a new
+    pipeline is just: add a SOURCE_META entry + add a branch here that picks
+    the right ticker filter (equities vs FX) and the right ML override
+    (None for daily, "<class>_1h" for intraday).
+
+    If `tickers` is provided, it's used as the universe (after the per-source
+    asset-class filter). Otherwise every tracked ticker in ohlcv_data is
+    fetched. This lets `/trading/run-now` pre-filter the universe down to
+    broker-valid symbols before running each pipeline."""
     from app.core.asset_class import is_fx
     from app.services.signal_service import SignalService
     from app.services.ohlcv_service import OHLCVService
     from app.strategies.donchian import DonchianService
 
-    ohlcv = OHLCVService(pool)
-    all_tickers = await ohlcv.get_available_tickers() or []
+    meta = SOURCE_META.get(source)
+    if meta is None:
+        raise ValueError(f"no runner for source {source!r}")
+    interval = meta["interval"]
+
+    if tickers is None:
+        ohlcv = OHLCVService(pool)
+        all_tickers = await ohlcv.get_available_tickers() or []
+    else:
+        all_tickers = tickers
+
     if source == "ml_equities":
         tickers = [t for t in all_tickers if not is_fx(t)]
-        svc     = SignalService(pool)
-        results = await svc.generate_batch(tickers, "1d")
+        results = await SignalService(pool).generate_batch(tickers, interval)
     elif source == "ml_fx":
         tickers = [t for t in all_tickers if is_fx(t)]
-        svc     = SignalService(pool)
-        results = await svc.generate_batch(tickers, "1d")
+        results = await SignalService(pool).generate_batch(tickers, interval)
     elif source == "rule_donchian":
         tickers = [t for t in all_tickers if is_fx(t)]
-        donch   = DonchianService(pool)
-        results = await donch.generate_batch(tickers, "1d")
+        results = await DonchianService(pool, interval=interval, source_tag=source).generate_batch(tickers, interval)
+    elif source == "ml_equities_1h":
+        # Same equity universe but force the equities_1h checkpoint folder.
+        tickers = [t for t in all_tickers if not is_fx(t)]
+        results = await SignalService(pool, asset_class_override="equities_1h", source_override=source).generate_batch(tickers, interval)
+    elif source == "ml_fx_1h":
+        tickers = [t for t in all_tickers if is_fx(t)]
+        results = await SignalService(pool, asset_class_override="fx_1h", source_override=source).generate_batch(tickers, interval)
+    elif source == "rule_donchian_1h":
+        tickers = [t for t in all_tickers if is_fx(t)]
+        results = await DonchianService(pool, interval=interval, source_tag=source).generate_batch(tickers, interval)
     else:
         raise ValueError(f"no runner for source {source!r}")
     return len(results)

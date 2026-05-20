@@ -196,14 +196,22 @@ async def refresh_fx_macros():
 
 
 async def regenerate_signals():
-    """Three-way signal regeneration honouring pipeline_config.enabled.
+    """Multi-pipeline signal regeneration honouring `pipeline_config.enabled`.
 
-    Each pipeline's enable flag lives in `pipeline_config`. Disabled
-    pipelines are skipped silently. After each pipeline runs (success or
-    failure), we UPSERT `last_run_at`/`last_signals_count`/`last_error`
-    so the /pipeline page can show status without a separate health check.
+    Loops over every enabled source in `pipeline_config` and dispatches it
+    through the shared `_run_pipeline_inner` helper — same code path the
+    `/pipelines/{source}/run` and `/pipelines/run-all` endpoints use, so
+    routing/persistence logic lives in one place. Disabled sources are
+    skipped silently. Each pipeline's run summary (count or error) is
+    UPSERTed into `pipeline_config` so the /strategies page reflects status
+    without a separate health check.
+
+    Adding a new pipeline requires only:
+      - A row in `pipeline_config` (via migration)
+      - A `SOURCE_META` entry + dispatch branch in `_run_pipeline_inner`
+    The scheduler picks it up automatically the next tick.
     """
-    logger.info("🔄 Scheduler: regenerating signals (three-way)...")
+    logger.info("🔄 Scheduler: regenerating signals...")
     try:
         pool = await get_db()
         tickers = await _get_tracked_tickers()
@@ -211,68 +219,36 @@ async def regenerate_signals():
             logger.info("⏭  Signal regen skipped — no tracked tickers.")
             return
 
-        from app.core.asset_class import is_fx
-        from app.strategies.donchian import DonchianService
-        from app.api.routes.pipelines import get_enabled_sources, record_run
+        from app.api.routes.pipelines import (
+            get_enabled_sources, record_run, _run_pipeline_inner, SOURCE_META,
+        )
 
         enabled = await get_enabled_sources(pool)
-
-        fx_tickers     = [t for t in tickers if is_fx(t)]
-        equity_tickers = [t for t in tickers if not is_fx(t)]
-
-        # ── ML equities ──────────────────────────────────────────────────────
-        if "ml_equities" in enabled:
-            if is_model_trained("equities") and equity_tickers:
+        if not enabled:
+            logger.info("⏭  No enabled pipelines.")
+        for src in sorted(enabled):
+            if src not in SOURCE_META:
+                logger.warning(f"⏭  Unknown source in pipeline_config: {src!r}")
+                continue
+            try:
+                n = await _run_pipeline_inner(pool, src)
+                await record_run(pool, src, signals_count=n, error=None)
+                logger.info(f"✅ pipeline {src}: {n} signals generated")
+            except Exception as e:
+                err = f"{type(e).__name__}: {e}"
                 try:
-                    svc = SignalService(pool)
-                    ml_eq_results = await svc.generate_batch(equity_tickers, "1d")
-                    await record_run(pool, "ml_equities", signals_count=len(ml_eq_results))
-                    logger.info(f"✅ ML equities: {len(ml_eq_results)} ({len(equity_tickers)} submitted)")
-                except Exception as e:
-                    await record_run(pool, "ml_equities", error=f"{type(e).__name__}: {e}")
-                    logger.error(f"❌ ML equities failed: {e}")
-            else:
-                logger.info("⏭  ML equities: skipped (no checkpoint or no equity tickers)")
-        else:
-            logger.info("⏭  ML equities: pipeline disabled in config")
-
-        # ── ML FX ────────────────────────────────────────────────────────────
-        if "ml_fx" in enabled:
-            if is_model_trained("fx") and fx_tickers:
-                try:
-                    svc = SignalService(pool)
-                    ml_fx_results = await svc.generate_batch(fx_tickers, "1d")
-                    await record_run(pool, "ml_fx", signals_count=len(ml_fx_results))
-                    logger.info(f"✅ ML FX: {len(ml_fx_results)} ({len(fx_tickers)} submitted)")
-                except Exception as e:
-                    await record_run(pool, "ml_fx", error=f"{type(e).__name__}: {e}")
-                    logger.error(f"❌ ML FX failed: {e}")
-            else:
-                logger.info("⏭  ML FX: skipped (no checkpoint or no FX tickers)")
-        else:
-            logger.info("⏭  ML FX: pipeline disabled in config")
-
-        # ── Donchian rule-based (FX only) ────────────────────────────────────
-        if "rule_donchian" in enabled:
-            if fx_tickers:
-                try:
-                    donchian = DonchianService(pool)
-                    d_results = await donchian.generate_batch(fx_tickers, "1d")
-                    await record_run(pool, "rule_donchian", signals_count=len(d_results))
-                    logger.info(f"📐 Donchian: {len(d_results)} ({len(fx_tickers)} submitted)")
-                except Exception as e:
-                    await record_run(pool, "rule_donchian", error=f"{type(e).__name__}: {e}")
-                    logger.error(f"❌ Donchian failed: {e}")
-            else:
-                logger.info("⏭  Donchian: no FX tickers")
-        else:
-            logger.info("⏭  Donchian: pipeline disabled in config")
+                    await record_run(pool, src, signals_count=None, error=err)
+                except Exception:
+                    pass
+                logger.error(f"❌ pipeline {src} failed: {err}")
 
     except Exception as e:
         logger.error(f"❌ Signal regen error: {e}")
         raise
 
-    # Auto-execute pulls all non-HOLD signals from every source by EV.
+    # Auto-execute pulls all non-HOLD signals from every source. The
+    # per-pipeline quota policy (top-conf within each, redistribute leftovers)
+    # is applied inside ExecutionService.auto_execute.
     await _auto_execute_trading(pool)
 
 
