@@ -241,10 +241,15 @@ async def run_all_and_trade(
     Synchronous — the HTTP request stays open until generation + execution
     both complete. Typical wall-clock: 1–3 minutes depending on universe
     size and DB latency. The caller should expect a long timeout.
+
+    Auto-refreshes OHLCV when stale (>24h) before generation so signals are
+    never produced on outdated bars. The refresh is a small "5d" period
+    fetch that fills weekend/holiday gaps cheaply.
     """
     # ── Guards ────────────────────────────────────────────────────────────
     from app.services.broker_service import BrokerService
     from app.services.execution_service import ExecutionService
+    from app.services.ohlcv_service import OHLCVService
 
     broker = BrokerService()
     if not await broker.is_connected():
@@ -260,6 +265,42 @@ async def run_all_and_trade(
     enabled = await get_enabled_sources(pool)
     if not enabled:
         return {"status": "noop", "reason": "no pipelines enabled"}
+
+    # ── Phase 0: OHLCV freshness ─────────────────────────────────────────
+    # Check the latest daily bar; if more than 24h old, top up the ingest
+    # before running inference. Otherwise the model predicts "next bar"
+    # from features that already happened, and the resulting trade signals
+    # are stale by construction. "5d" period is enough to fill any weekend
+    # or holiday gap without hitting yfinance for years of irrelevant data.
+    ohlcv_refresh: dict = {"checked": False, "refreshed": False}
+    try:
+        async with pool.acquire() as conn:
+            staleness_row = await conn.fetchrow(
+                "SELECT EXTRACT(EPOCH FROM (NOW() - MAX(timestamp))) / 3600.0 AS hours "
+                "FROM ohlcv_data WHERE interval = '1d'"
+            )
+        stale_hours = float(staleness_row["hours"]) if staleness_row and staleness_row["hours"] is not None else 9999.0
+        ohlcv_refresh = {"checked": True, "stale_hours": round(stale_hours, 2), "refreshed": False}
+
+        if stale_hours > 24.0:
+            logger.info(f"OHLCV stale ({stale_hours:.1f}h) — refreshing before run-all-and-trade")
+            ohlcv = OHLCVService(pool)
+            all_tickers = await ohlcv.get_available_tickers() or []
+            if all_tickers:
+                success, failed, count, _ = await ohlcv.ingest_tickers(all_tickers, "1d", "5d")
+                ohlcv_refresh.update({
+                    "refreshed":     True,
+                    "tickers_ok":    len(success),
+                    "tickers_fail":  len(failed),
+                    "rows_upserted": count,
+                })
+                logger.info(f"✅ OHLCV refresh: {count} rows, {len(success)}/{len(all_tickers)} tickers")
+    except Exception as e:
+        # A failed refresh shouldn't block trading — generation will use
+        # whatever the table has, even if stale. We still surface it in
+        # the response so the UI can warn the user.
+        logger.warning(f"OHLCV freshness check failed: {type(e).__name__}: {e}")
+        ohlcv_refresh = {"checked": True, "refreshed": False, "error": str(e)}
 
     # ── Phase 1: generate signals from every enabled pipeline (sequential) ─
     # Sequential so the three pipelines don't contend for the GPU and the DB
@@ -290,6 +331,7 @@ async def run_all_and_trade(
 
     return {
         "status":           "complete",
+        "ohlcv_refresh":    ohlcv_refresh,
         "pipelines":        pipeline_results,
         "orders_attempted": len(results),
         "orders_filled":    len(filled),

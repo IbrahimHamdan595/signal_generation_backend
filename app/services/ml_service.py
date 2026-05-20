@@ -1,3 +1,4 @@
+import asyncio
 import os
 import torch
 import numpy as np
@@ -941,7 +942,15 @@ class MLService:
         current_ts = datetime.now(timezone.utc)
         # 8 MC samples gives ~80% of the uncertainty signal at ~40% the latency
         # of n=20 — solid trade-off for live inference.
-        result     = model.mc_predict(
+        #
+        # `asyncio.to_thread` ships the synchronous PyTorch + CUDA call to a
+        # thread-pool worker. The event loop stays free to service DB pool
+        # heartbeats, scheduler ticks, and other API requests while this
+        # ticker's inference runs. Without it, a Generate & Trade batch
+        # blocked the loop for 30+ minutes and triggered cascading
+        # "maximum running instances reached" warnings on every cron job.
+        result = await asyncio.to_thread(
+            model.mc_predict,
             x_price, x_sent,
             n_samples=8,
             temperature=temperature,
