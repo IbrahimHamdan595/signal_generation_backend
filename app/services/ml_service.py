@@ -237,8 +237,14 @@ class MLService:
         val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, drop_last=False)
         test_loader  = DataLoader(test_ds,  batch_size=batch_size, shuffle=False, drop_last=False)
 
-        # FX uses 54 features (51 base + 3 macro globals). Equities stays at 51.
-        n_feat = len(FEATURE_COLS_FX) if ac == "fx" else len(FEATURE_COLS)
+        # FX uses 57 features (51 base + macro globals + vol + 4h cols).
+        # Equities stays at 51. The check covers both "fx" (daily) and
+        # "fx_1h" (intraday) — both train on the same FX feature set since
+        # the dataset builder picks FEATURE_COLS_FX whenever is_fx(ticker)
+        # is true. Without the _1h check, training fx_1h would build a 51-
+        # input model on 57-dim data and crash at the first matmul.
+        is_fx_class = ac.startswith("fx")
+        n_feat = len(FEATURE_COLS_FX) if is_fx_class else len(FEATURE_COLS)
         model_config = {
             "n_features":         n_feat,
             "seq_len":            seq_len,
@@ -692,8 +698,11 @@ class MLService:
         is_signal  = (labels == 1) | (labels == 2)     # true BUY or SELL
         total_true = max(is_signal.sum(), 1)
 
-        # Per-asset-class precision floors.
-        if asset_class == "fx":
+        # Per-asset-class precision floors. FX runs (daily + 1h) get a
+        # lower floor because the FX models historically achieve lower
+        # precision than equities — using the equity floor would reject
+        # every FX threshold combo and return no actionable model.
+        if asset_class.startswith("fx"):
             strict_floor,  strict_recall  = 0.50, 0.01
             relaxed_floor, relaxed_recall = 0.45, 0.005
         else:
@@ -1139,7 +1148,15 @@ class MLService:
                 "probs":        [1.0, 0.0, 0.0, 0.0],
             },
             "anchor_close": round(current_close, 4),
-            "source":       "ml_fx" if ac in ("fx_major", "fx_metal", "fx") else "ml_equities",
+            # Note: SignalService applies a source_override (e.g. "ml_fx_1h")
+            # before writing to the DB. This default just gives downstream
+            # callers a reasonable per-asset-class tag when no override is set.
+            "source":       (
+                "ml_fx_1h"      if ac == "fx_1h"
+                else "ml_equities_1h" if ac == "equities_1h"
+                else "ml_fx"    if ac in ("fx_major", "fx_metal", "fx")
+                else "ml_equities"
+            ),
             "generated_at": current_ts.isoformat(),
         }
 

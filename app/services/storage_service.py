@@ -17,7 +17,7 @@ CHECKPOINT_FILES = [
     "versions.json",
 ]
 
-ASSET_CLASS_SUBFOLDERS = ("equities", "fx")
+ASSET_CLASS_SUBFOLDERS = ("equities", "fx", "equities_1h", "fx_1h")
 
 
 def _client():

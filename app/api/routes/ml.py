@@ -168,9 +168,10 @@ async def train_model(
             import os as _os
 
             # Persist last_train_result.json into the asset-class subfolder
-            # so equities and fx runs don't trample each other.
-            ac = (body.asset_class or "equities").lower()
-            ac = "equities" if ac in ("equity", "equities") else "fx"
+            # so the 4 runs (equities/fx/equities_1h/fx_1h) don't trample
+            # each other's result files.
+            from app.ml.models.registry import _normalize_asset_class
+            ac = _normalize_asset_class(body.asset_class or "equities")
             out_dir = _os.path.join("checkpoints", ac)
             _os.makedirs(out_dir, exist_ok=True)
             with open(_os.path.join(out_dir, "last_train_result.json"), "w") as f:
