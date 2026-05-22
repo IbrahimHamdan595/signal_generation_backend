@@ -869,9 +869,10 @@ class MLService:
 
         scaler = load_scaler_params(ac)
 
+        seq_len = _mcfg.get("seq_len", SEQUENCE_LEN)
         builder = DatasetBuilder(self.pool)
         X_price, X_sent, _, _, _, _ = await builder.build(
-            [ticker], interval, sequence_len=SEQUENCE_LEN
+            [ticker], interval, sequence_len=seq_len
         )
 
         if X_price is None or len(X_price) == 0:

@@ -69,10 +69,11 @@ class OHLCVService:
                         total += count
                     logger.info(f"✅ {ticker}: {count} records ingested")
                 except Exception as e:
+                    import traceback
                     async with lock:
                         failed.append(ticker.upper())
                         failed_details.append({"ticker": ticker.upper(), "error": str(e)})
-                    logger.error(f"❌ {ticker}: {e}")
+                    logger.error(f"❌ {ticker}: {e}\n{traceback.format_exc()}")
 
         await asyncio.gather(*[_fetch_one(t) for t in tickers])
         return success, failed, total, failed_details
