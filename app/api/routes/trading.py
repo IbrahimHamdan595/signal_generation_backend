@@ -221,7 +221,25 @@ async def get_positions(
     broker = BrokerService()
     if not await broker.is_connected():
         raise HTTPException(400, "MT5 not connected")
-    return await broker.get_open_positions()
+    positions = await broker.get_open_positions()
+    if not positions:
+        return positions
+    tickets = [p["ticket"] for p in positions if p.get("ticket")]
+    if tickets and pool:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT te.mt5_ticket, s.source
+                FROM trade_executions te
+                LEFT JOIN signals s ON s.id = te.signal_id
+                WHERE te.mt5_ticket = ANY($1::bigint[])
+                """,
+                tickets,
+            )
+        source_map = {r["mt5_ticket"]: r["source"] for r in rows}
+        for p in positions:
+            p["source"] = source_map.get(p.get("ticket"))
+    return positions
 
 
 @router.post("/positions/{ticket}/close")
