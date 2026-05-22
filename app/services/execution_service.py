@@ -311,7 +311,7 @@ class ExecutionService:
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT te.*, s.ticker, s.action, s.confidence
+                SELECT te.*, s.ticker, s.action, s.confidence, s.source
                 FROM trade_executions te
                 LEFT JOIN signals s ON s.id = te.signal_id
                 WHERE te.user_id = $1
