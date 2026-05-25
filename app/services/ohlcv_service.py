@@ -607,6 +607,11 @@ class OHLCVService:
         eps_history: Optional[Dict[str, float]] = None,
         ticker: Optional[str] = None,
     ) -> pd.DataFrame:
+        if len(df) < 14:
+            raise ValueError(
+                f"Too few bars ({len(df)}) to compute indicators — need at least 14"
+            )
+
         out = df[["timestamp"]].copy()
         close = df["close"]
         high = df["high"]

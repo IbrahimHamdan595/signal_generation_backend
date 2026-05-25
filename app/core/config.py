@@ -31,6 +31,13 @@ class Settings(BaseSettings):
     # Used for CPI and NFP release date calendars. Falls back to algorithmic if unset.
     FRED_API_KEY: str = ""
 
+    # MT5 auto-connect — set these in .env on the VPS so the backend
+    # reconnects automatically on startup without manual UI interaction.
+    MT5_ACCOUNT:  int = 0
+    MT5_PASSWORD: str = ""
+    MT5_SERVER:   str = ""
+    MT5_PATH:     str = ""
+
     CORS_ALLOWED_ORIGINS: str = "http://localhost:3000,http://localhost:8501"
 
     APP_NAME: str = "Trading Signal API"

@@ -490,6 +490,22 @@ async def run_health_checks():
     try:
         pool = await get_db()
         broker = BrokerService()
+
+        # Auto-reconnect MT5 if credentials are in .env and connection dropped
+        if not await broker.is_connected():
+            from app.core.config import settings
+            if settings.MT5_ACCOUNT and settings.MT5_PASSWORD and settings.MT5_SERVER:
+                ok, err = await broker.connect(
+                    account=settings.MT5_ACCOUNT,
+                    password=settings.MT5_PASSWORD,
+                    server=settings.MT5_SERVER,
+                    path=settings.MT5_PATH or None,
+                )
+                if ok:
+                    logger.info("✅ MT5 auto-reconnected via health check")
+                else:
+                    logger.warning(f"⚠️  MT5 auto-reconnect failed: {err}")
+
         monitor = HealthMonitor(pool, broker)
         await monitor.run_checks()
     except Exception as e:

@@ -37,6 +37,23 @@ async def lifespan(app: FastAPI):
     for ac in ("equities", "fx", "equities_1h", "fx_1h"):
         load_model(ac)
     start_scheduler()
+
+    # Auto-connect MT5 if credentials are baked into .env (VPS deployment).
+    # Failures are logged but never fatal — the UI connect form is the fallback.
+    if settings.MT5_ACCOUNT and settings.MT5_PASSWORD and settings.MT5_SERVER:
+        from app.services.broker_service import BrokerService
+        broker = BrokerService()
+        ok, err = await broker.connect(
+            account=settings.MT5_ACCOUNT,
+            password=settings.MT5_PASSWORD,
+            server=settings.MT5_SERVER,
+            path=settings.MT5_PATH or None,
+        )
+        if ok:
+            logger.info("✅ MT5 auto-connected from .env credentials")
+        else:
+            logger.warning(f"⚠️  MT5 auto-connect failed (will retry via health check): {err}")
+
     yield
     stop_scheduler()
     await close_db()
