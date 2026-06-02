@@ -285,7 +285,7 @@ async def run_now(
     ohlcv_svc = OHLCVService(pool)
     tickers = await ohlcv_svc.get_available_tickers()
     if not tickers:
-        raise HTTPException(400, "No tickers in database — add tickers to your watchlist first")
+        raise HTTPException(400, "No tickers in database — ingest OHLCV data first")
 
     # 2. Validate which tickers exist on this broker
     suffix = config.get("symbol_suffix") or ""
@@ -448,3 +448,108 @@ async def get_executions(
     return await exec_svc.get_executions(
         current_user["id"], limit=min(limit, 100), offset=offset
     )
+
+
+@router.get("/activity")
+async def get_activity(
+    limit: int = 20,
+    pool=Depends(get_db),
+    current_user=Depends(get_current_active_user),
+):
+    """
+    Unified activity feed for the dashboard. UNIONs four virtual event streams
+    from the last 24h:
+      - signal_generation   (per-source, grouped to the minute)
+      - order_fill          (trade_executions status='filled')
+      - order_close         (trade_executions status='closed')
+      - order_reject        (trade_executions status='rejected_commission')
+    Returns the most recent `limit` events DESC by timestamp.
+    """
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            WITH gens AS (
+              SELECT
+                date_trunc('minute', created_at) AS ts,
+                'signal_generation'::text       AS kind,
+                source                           AS source,
+                NULL::text                       AS symbol,
+                COUNT(*)::int                    AS count,
+                NULL::float                      AS pnl
+              FROM signals
+              WHERE created_at >= NOW() - INTERVAL '24 hours'
+              GROUP BY 1, source
+            ),
+            fills AS (
+              SELECT te.created_at, 'order_fill'::text, s.source, te.symbol, 1, NULL::float
+              FROM trade_executions te LEFT JOIN signals s ON s.id = te.signal_id
+              WHERE te.status = 'filled' AND te.created_at >= NOW() - INTERVAL '24 hours'
+            ),
+            closes AS (
+              SELECT te.closed_at, 'order_close'::text, s.source, te.symbol, 1, te.pnl
+              FROM trade_executions te LEFT JOIN signals s ON s.id = te.signal_id
+              WHERE te.status = 'closed'
+                AND te.closed_at IS NOT NULL
+                AND te.closed_at >= NOW() - INTERVAL '24 hours'
+            ),
+            rejects AS (
+              SELECT te.created_at, 'order_reject'::text, s.source, te.symbol, 1, NULL::float
+              FROM trade_executions te LEFT JOIN signals s ON s.id = te.signal_id
+              WHERE te.status = 'rejected_commission'
+                AND te.created_at >= NOW() - INTERVAL '24 hours'
+            )
+            SELECT * FROM gens
+            UNION ALL SELECT * FROM fills
+            UNION ALL SELECT * FROM closes
+            UNION ALL SELECT * FROM rejects
+            ORDER BY ts DESC NULLS LAST
+            LIMIT $1
+            """,
+            limit,
+        )
+    return [
+        {
+            "ts":     r["ts"].isoformat() if r["ts"] else None,
+            "kind":   r["kind"],
+            "source": r["source"],
+            "symbol": r["symbol"],
+            "count":  r["count"],
+            "pnl":    float(r["pnl"]) if r["pnl"] is not None else None,
+        }
+        for r in rows
+    ]
+
+
+@router.get("/commission-stats")
+async def get_commission_stats(
+    days: int = 7,
+    pool=Depends(get_db),
+    current_user=Depends(get_current_active_user),
+):
+    """
+    Total broker commission saved by the Path A commission gate over the
+    last `days` days. Sums COMMISSION_USD[asset_class] per rejected signal.
+    """
+    from app.services.execution_service import COMMISSION_USD
+    from app.core.asset_class import asset_class_for
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT te.symbol, s.ticker
+            FROM trade_executions te
+            LEFT JOIN signals s ON s.id = te.signal_id
+            WHERE te.status = 'rejected_commission'
+              AND te.created_at >= NOW() - ($1 || ' days')::interval
+            """,
+            str(days),
+        )
+    saved = 0.0
+    for r in rows:
+        ac = asset_class_for(r["ticker"] or r["symbol"] or "")
+        saved += COMMISSION_USD.get(ac, 15.0)
+    return {
+        "days":                days,
+        "signals_filtered":    len(rows),
+        "commission_saved_usd": round(saved, 2),
+    }

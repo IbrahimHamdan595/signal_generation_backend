@@ -29,12 +29,7 @@ class UserResponse(BaseModel):
     email: str
     is_active: bool
     is_admin: bool
-    watchlist: List[str]
     created_at: datetime
-
-
-class WatchlistUpdate(BaseModel):
-    tickers: List[str] = Field(..., min_length=1)
 
 
 # ── OHLCV ─────────────────────────────────────────────────────────────────────

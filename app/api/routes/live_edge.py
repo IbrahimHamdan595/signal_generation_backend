@@ -10,16 +10,13 @@ GET  /live-edge/summary        — overall live performance vs predicted
 GET  /live-edge/daily          — per-day breakdown
 GET  /live-edge/calibration    — confidence vs actual win rate buckets
 GET  /live-edge/slippage       — distribution of fill price vs signal price
-POST /live-edge/backtest       — run real-fill backtest on historical signals
 """
 
 from fastapi import APIRouter, Depends, Query
-from typing import Optional, List
 import logging
 
 from app.core.security import get_current_active_user
 from app.db.database import get_db
-from app.services.realfill_backtest_service import RealFillBacktestService
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/live-edge", tags=["Live Edge"])
@@ -193,16 +190,3 @@ async def slippage(current_user=Depends(get_current_active_user)):
     }
 
 
-@router.post("/backtest")
-async def run_backtest(
-    tickers: List[str],
-    interval: str = "1d",
-    current_user=Depends(get_current_active_user),
-):
-    """
-    Run real-fill backtest on historical signals stored in DB. Walks actual
-    OHLCV bars forward from each signal — gives the honest Sharpe / win rate.
-    """
-    pool = await get_db()
-    svc = RealFillBacktestService(pool)
-    return await svc.backtest_portfolio(tickers, interval)

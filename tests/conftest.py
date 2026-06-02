@@ -38,9 +38,8 @@ class MockConnection:
                 "password_hash": args[2] if len(args) > 2 else None,
                 "is_active": args[3] if len(args) > 3 else True,
                 "is_admin": args[4] if len(args) > 4 else False,
-                "watchlist": args[5] if len(args) > 5 else [],
-                "created_at": args[6] if len(args) > 6 else None,
-                "updated_at": args[7] if len(args) > 7 else None,
+                "created_at": args[5] if len(args) > 5 else None,
+                "updated_at": args[6] if len(args) > 6 else None,
             }
             # Store for later retrieval
             if args[1]:  # email

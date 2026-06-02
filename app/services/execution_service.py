@@ -497,6 +497,22 @@ class ExecutionService:
         )
         if not profit_ok:
             logger.info(f"⏭  Skipping sig#{signal_id} {ticker} — {profit_reason}")
+            # Persist the rejection so dashboard counters and the activity feed
+            # can show "Commission saved this week: $X / Y signals filtered".
+            try:
+                async with self.pool.acquire() as conn:
+                    await conn.execute(
+                        """
+                        INSERT INTO trade_executions
+                          (signal_id, user_id, symbol, order_type, volume,
+                           requested_price, status, mt5_comment)
+                        VALUES ($1,$2,$3,$4,$5,$6,'rejected_commission',$7)
+                        """,
+                        signal_id, user_id, symbol, action, volume, current, profit_reason,
+                    )
+            except Exception as e:
+                # Don't let logging fail the request — just warn
+                logger.warning(f"Could not persist commission rejection: {e}")
             return {"ok": False, "signal_id": signal_id, "error": profit_reason}
 
         # ── Place order ───────────────────────────────────────────────────────

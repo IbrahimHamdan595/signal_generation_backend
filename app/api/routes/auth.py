@@ -40,7 +40,6 @@ async def register(data: RegisterRequest, pool=Depends(get_db)):
         email=user["email"],
         is_active=user.get("is_active", True),
         is_admin=user.get("is_admin", False),
-        watchlist=list(user.get("watchlist", [])),
         created_at=user.get("created_at"),
     )
 
@@ -109,6 +108,5 @@ async def get_me(current_user=Depends(get_current_active_user)):
         email=current_user["email"],
         is_active=current_user.get("is_active", True),
         is_admin=current_user.get("is_admin", False),
-        watchlist=list(current_user.get("watchlist", [])),
         created_at=current_user.get("created_at"),
     )
