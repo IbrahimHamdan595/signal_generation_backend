@@ -70,7 +70,7 @@ async def summary(
         "losses":                int(row["losses"] or 0),
         "actual_win_rate":       round(float(row["actual_win_rate"]), 4),
         "avg_predicted_conf":    round(float(row["avg_confidence"]), 4),
-        "calibration_gap":       round(float(row["avg_confidence"] - row["actual_win_rate"]), 4),
+        "calibration_gap":       round(float(row["avg_confidence"]) - float(row["actual_win_rate"]), 4),
         "realized_pnl":          round(float(row["realized_pnl"]), 2),
         "avg_pnl":               round(float(row["avg_pnl"]), 4),
         "avg_slippage_pct":      round(float(row["slippage_pct"]) * 100, 4),
