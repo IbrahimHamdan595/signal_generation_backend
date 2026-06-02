@@ -107,14 +107,28 @@ class ReconciliationService:
             from datetime import datetime as _dt, timedelta
             deals = mt5.history_deals_get(_dt.now() - timedelta(days=90), _dt.now())
             if not deals:
+                logger.warning(f"⚠️  mt5.history_deals_get returned empty for ticket {ticket}")
                 return None
             total = 0.0
             found = False
+            t = int(ticket)
+            # We store result.order as mt5_ticket, but the deal record may match
+            # via position_id, order, or ticket depending on broker conventions.
+            # Try all three so we don't miss legitimate matches.
             for d in deals:
-                if int(d.position_id) == int(ticket):
+                pid = int(getattr(d, "position_id", 0) or 0)
+                oid = int(getattr(d, "order",       0) or 0)
+                did = int(getattr(d, "ticket",      0) or 0)
+                if pid == t or oid == t or did == t:
                     found = True
-                    total += float(d.profit) + float(getattr(d, "swap", 0) or 0) \
-                                              + float(getattr(d, "commission", 0) or 0)
+                    total += float(d.profit) \
+                           + float(getattr(d, "swap",       0) or 0) \
+                           + float(getattr(d, "commission", 0) or 0)
+            if not found:
+                logger.warning(
+                    f"⚠️  Ticket {ticket} not found in {len(deals)} MT5 deals "
+                    f"(checked position_id, order, ticket)"
+                )
             return total if found else None
 
         try:
