@@ -379,6 +379,59 @@ async def run_now(
     }
 
 
+@router.post("/backfill-pnl")
+async def backfill_pnl(
+    pool=Depends(get_db),
+    current_user=Depends(get_current_active_user),
+):
+    """
+    One-off recovery: walk every closed trade with NULL pnl and try to pull
+    its realised pnl from MT5's 90-day deal history. Use after restoring
+    connectivity, fixing a reconciler bug, or any time the dashboard shows
+    a large 'null_pnl' bucket in trade_executions.
+    """
+    broker = BrokerService()
+    if not await broker.is_connected():
+        raise HTTPException(400, "MT5 not connected — call POST /trading/connect first")
+
+    from app.services.reconciliation_service import ReconciliationService
+    recon = ReconciliationService(pool, broker)
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, mt5_ticket
+            FROM trade_executions
+            WHERE status = 'closed'
+              AND pnl IS NULL
+              AND mt5_ticket IS NOT NULL
+            ORDER BY closed_at DESC NULLS LAST
+            """
+        )
+
+    recovered, missing = [], []
+    for r in rows:
+        ticket = int(r["mt5_ticket"])
+        pnl = await recon._lookup_closed_pnl(ticket)
+        if pnl is None:
+            missing.append(ticket)
+            continue
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE trade_executions SET pnl = $1 WHERE id = $2",
+                float(pnl), int(r["id"]),
+            )
+        recovered.append({"ticket": ticket, "pnl": float(pnl)})
+
+    return {
+        "total_null":       len(rows),
+        "recovered_count":  len(recovered),
+        "missing_count":    len(missing),
+        "recovered":        recovered[:50],
+        "missing_tickets":  missing[:50],
+    }
+
+
 @router.get("/executions")
 async def get_executions(
     limit: int = 20,

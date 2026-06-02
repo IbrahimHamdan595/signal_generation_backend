@@ -93,22 +93,35 @@ class ReconciliationService:
         return result
 
     async def _lookup_closed_pnl(self, ticket: int) -> float | None:
-        """Pull the closed-deal PnL from MT5 history for a given position ticket."""
+        """Pull the closed-deal PnL from MT5 history for a given position ticket.
+
+        Sums profit + swap + commission across ALL deals for the position so
+        partial fills and multi-leg closes resolve correctly. 90-day lookback
+        is generous — MT5 keeps history far longer; tighter windows were
+        missing positions closed >1 week ago and leaving pnl=NULL.
+        """
         from app.services.broker_service import _import_mt5, _run
 
         def _hist():
             mt5 = _import_mt5()
             from datetime import datetime as _dt, timedelta
-            deals = mt5.history_deals_get(_dt.now() - timedelta(days=7), _dt.now())
+            deals = mt5.history_deals_get(_dt.now() - timedelta(days=90), _dt.now())
             if not deals:
                 return None
+            total = 0.0
+            found = False
             for d in deals:
                 if int(d.position_id) == int(ticket):
-                    return float(d.profit)
-            return None
+                    found = True
+                    total += float(d.profit) + float(getattr(d, "swap", 0) or 0) \
+                                              + float(getattr(d, "commission", 0) or 0)
+            return total if found else None
 
         try:
-            return await _run(_hist)
+            pnl = await _run(_hist)
+            if pnl is None:
+                logger.warning(f"⚠️  No MT5 deal history found for ticket {ticket} — pnl will stay NULL")
+            return pnl
         except Exception as e:
-            logger.debug(f"Could not look up history for ticket {ticket}: {e}")
+            logger.warning(f"Could not look up history for ticket {ticket}: {e}")
             return None
