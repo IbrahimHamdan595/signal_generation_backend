@@ -381,14 +381,17 @@ async def run_now(
 
 @router.post("/backfill-pnl")
 async def backfill_pnl(
+    include_zero: bool = False,
     pool=Depends(get_db),
     current_user=Depends(get_current_active_user),
 ):
     """
-    One-off recovery: walk every closed trade with NULL pnl and try to pull
-    its realised pnl from MT5's 90-day deal history. Use after restoring
-    connectivity, fixing a reconciler bug, or any time the dashboard shows
-    a large 'null_pnl' bucket in trade_executions.
+    One-off recovery: walk every closed trade with NULL pnl (or pnl=0 when
+    include_zero=true) and pull realised pnl from MT5's 90-day deal history.
+
+    Pass include_zero=true to also re-process rows recorded as pnl=0 by an
+    earlier reconciler version that returned the opening deal's profit
+    (which is always 0) instead of summing all deals for the position.
     """
     broker = BrokerService()
     if not await broker.is_connected():
@@ -397,13 +400,14 @@ async def backfill_pnl(
     from app.services.reconciliation_service import ReconciliationService
     recon = ReconciliationService(pool, broker)
 
+    where_clause = "pnl IS NULL" if not include_zero else "(pnl IS NULL OR pnl = 0)"
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            """
+            f"""
             SELECT id, mt5_ticket
             FROM trade_executions
             WHERE status = 'closed'
-              AND pnl IS NULL
+              AND {where_clause}
               AND mt5_ticket IS NOT NULL
             ORDER BY closed_at DESC NULLS LAST
             """
