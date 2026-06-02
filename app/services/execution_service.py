@@ -29,6 +29,22 @@ from app.services.broker_service import BrokerService
 logger = logging.getLogger(__name__)
 
 
+# ── Broker commission estimates ──────────────────────────────────────────────
+# Per-instrument round-trip commission for the configured broker (AmanaCapital
+# demo). Equity CFDs charge a fixed $15 per round-trip; FX pairs charge only
+# spread (a few dollars on a standard lot). Update if you change brokers.
+COMMISSION_USD = {
+    "equity":   15.0,
+    "fx_major":  1.0,
+    "fx_metal":  3.0,
+}
+
+# Predicted gross profit must exceed COMMISSION × this multiplier before the
+# trade is allowed. 2.0 means the model must predict ≥ 2× commission as gross
+# profit so a small directional miss still leaves the trade above breakeven.
+COMMISSION_SAFETY_FACTOR = 2.0
+
+
 class ExecutionService:
     def __init__(self, pool: asyncpg.Pool, broker: BrokerService):
         self.pool = pool
@@ -468,6 +484,21 @@ class ExecutionService:
             live_sl = round(current + entry_distance, sym_info["digits"])
             live_tp = round(current - tp_distance, sym_info["digits"])
 
+        # ── Guard: predicted profit must exceed broker commission ────────────
+        # Forward test showed 31 of 84 losses were pure commission charges
+        # (-$15 each on equity CFDs) where the price didn't move enough to
+        # overcome the broker's fixed round-trip cost. This gate filters those
+        # trades out before they're placed.
+        profit_ok, profit_reason = self._profit_covers_commission(
+            ticker=ticker,
+            tp_distance=tp_distance,
+            volume=volume,
+            contract_size=sym_info["contract_size"],
+        )
+        if not profit_ok:
+            logger.info(f"⏭  Skipping sig#{signal_id} {ticker} — {profit_reason}")
+            return {"ok": False, "signal_id": signal_id, "error": profit_reason}
+
         # ── Place order ───────────────────────────────────────────────────────
         logger.info(
             f"📤 Placing {action} {volume} lots of {symbol} | "
@@ -532,6 +563,34 @@ class ExecutionService:
             }
 
     # ── Risk helpers ──────────────────────────────────────────────────────────
+
+    def _profit_covers_commission(
+        self,
+        ticker: str,
+        tp_distance: float,
+        volume: float,
+        contract_size: float,
+    ) -> tuple[bool, str]:
+        """
+        Reject trades where predicted gross profit cannot cover broker commission.
+
+        Approximate gross profit = tp_distance × volume × contract_size, expressed
+        in the quote currency. For most pairs the quote is USD; for crosses where
+        USD is the base (e.g. USDJPY) this overestimates USD profit slightly, but
+        the safety factor compensates.
+        """
+        from app.core.asset_class import asset_class_for
+        asset_class = asset_class_for(ticker)
+        commission = COMMISSION_USD.get(asset_class, 15.0)
+        threshold  = commission * COMMISSION_SAFETY_FACTOR
+        expected_profit = abs(tp_distance) * volume * contract_size
+
+        if expected_profit < threshold:
+            return False, (
+                f"predicted gross ${expected_profit:.2f} < {COMMISSION_SAFETY_FACTOR:.1f}× "
+                f"commission (${threshold:.2f}, asset_class={asset_class})"
+            )
+        return True, ""
 
     def _calculate_volume(
         self,

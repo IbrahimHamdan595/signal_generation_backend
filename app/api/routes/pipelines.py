@@ -222,6 +222,43 @@ async def update_pipeline(
     return _decorate(dict(updated))
 
 
+@router.post("/bulk-toggle")
+async def bulk_toggle(
+    sources: dict[str, bool],
+    pool=Depends(get_db),
+    current_user=Depends(get_current_active_user),
+):
+    """
+    Toggle multiple pipelines on/off in one call. Body: {"<source>": <bool>, ...}
+
+    Useful for one-shot cleanups like 'disable all losing pipelines after a
+    forward test'. Unknown sources return 400. Returns the new state of each
+    pipeline.
+    """
+    unknown = [s for s in sources if s not in SOURCE_META]
+    if unknown:
+        raise HTTPException(400, f"unknown sources: {unknown}")
+
+    results = {}
+    async with pool.acquire() as conn:
+        for source, enabled in sources.items():
+            row = await conn.fetchrow(
+                """
+                UPDATE pipeline_config
+                SET enabled = $2, updated_at = NOW()
+                WHERE source = $1
+                RETURNING source, enabled
+                """,
+                source, bool(enabled),
+            )
+            if row:
+                results[row["source"]] = bool(row["enabled"])
+                logger.info(f"pipeline_config bulk-toggle: {source} → enabled={enabled}")
+            else:
+                results[source] = None  # pipeline_config row missing — skipped
+    return {"updated": results}
+
+
 @router.post("/{source}/run")
 async def run_one(
     source: str,
