@@ -36,13 +36,16 @@ async def summary(
         row = await conn.fetchrow(
             """
             SELECT
-              COUNT(*)                                                     AS total_trades,
-              COUNT(*) FILTER (WHERE te.pnl > 0)                            AS wins,
-              COUNT(*) FILTER (WHERE te.pnl < 0)                            AS losses,
-              COALESCE(SUM(te.pnl), 0)                                      AS realized_pnl,
-              COALESCE(AVG(te.pnl), 0)                                      AS avg_pnl,
-              COALESCE(AVG(s.confidence), 0)                                AS avg_confidence,
-              COALESCE(AVG(CASE WHEN te.pnl > 0 THEN 1.0 ELSE 0.0 END), 0)  AS actual_win_rate,
+              COUNT(*)                                                              AS total_trades,
+              COUNT(*) FILTER (WHERE te.pnl > 0)                                     AS wins,
+              COUNT(*) FILTER (WHERE te.pnl < 0)                                     AS losses,
+              COUNT(*) FILTER (WHERE te.pnl = 0)                                     AS breakeven,
+              COALESCE(SUM(te.pnl) FILTER (WHERE te.pnl > 0), 0)                     AS gross_wins,
+              COALESCE(SUM(te.pnl) FILTER (WHERE te.pnl < 0), 0)                     AS gross_losses,
+              COALESCE(SUM(te.pnl), 0)                                               AS realized_pnl,
+              COALESCE(AVG(te.pnl), 0)                                               AS avg_pnl,
+              COALESCE(AVG(s.confidence), 0)                                         AS avg_confidence,
+              COALESCE(AVG(CASE WHEN te.pnl > 0 THEN 1.0 ELSE 0.0 END), 0)           AS actual_win_rate,
               COALESCE(
                 AVG(ABS(te.fill_price - te.requested_price) / NULLIF(te.requested_price,0))
                   FILTER (WHERE te.requested_price IS NOT NULL AND te.requested_price <> 0),
@@ -63,8 +66,11 @@ async def summary(
     return {
         "days":                  days,
         "total_trades":          total,
-        "wins":                  int(row["wins"] or 0),
-        "losses":                int(row["losses"] or 0),
+        "wins":                  int(row["wins"]      or 0),
+        "losses":                int(row["losses"]    or 0),
+        "breakeven":             int(row["breakeven"] or 0),
+        "gross_wins":            round(float(row["gross_wins"]   or 0), 2),
+        "gross_losses":          round(float(row["gross_losses"] or 0), 2),
         "actual_win_rate":       round(float(row["actual_win_rate"]), 4),
         "avg_predicted_conf":    round(float(row["avg_confidence"]), 4),
         "calibration_gap":       round(float(row["avg_confidence"]) - float(row["actual_win_rate"]), 4),
