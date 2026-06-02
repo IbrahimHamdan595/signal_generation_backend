@@ -46,7 +46,11 @@ async def summary(
               COALESCE(AVG(te.pnl), 0)                                      AS avg_pnl,
               COALESCE(AVG(s.confidence), 0)                                AS avg_confidence,
               COALESCE(AVG(CASE WHEN te.pnl > 0 THEN 1.0 ELSE 0.0 END), 0)  AS actual_win_rate,
-              COALESCE(AVG(ABS(te.fill_price - s.entry_price) / NULLIF(s.entry_price,0)), 0) AS slippage_pct
+              COALESCE(
+                AVG(ABS(te.fill_price - te.requested_price) / NULLIF(te.requested_price,0))
+                  FILTER (WHERE te.requested_price IS NOT NULL AND te.requested_price <> 0),
+                0
+              ) AS slippage_pct
             FROM trade_executions te
             JOIN signals s ON s.id = te.signal_id
             WHERE te.status = 'closed'
@@ -89,7 +93,8 @@ async def daily(
               SUM(te.pnl)                                                   AS pnl,
               AVG(CASE WHEN te.pnl > 0 THEN 1.0 ELSE 0.0 END)               AS win_rate,
               AVG(s.confidence)                                             AS avg_conf,
-              AVG(ABS(te.fill_price - s.entry_price) / NULLIF(s.entry_price,0)) AS slippage
+              AVG(ABS(te.fill_price - te.requested_price) / NULLIF(te.requested_price,0))
+                FILTER (WHERE te.requested_price IS NOT NULL AND te.requested_price <> 0) AS slippage
             FROM trade_executions te
             JOIN signals s ON s.id = te.signal_id
             WHERE te.status = 'closed'
@@ -166,12 +171,12 @@ async def slippage(current_user=Depends(get_current_active_user)):
               MAX(s_pct) AS worst,
               AVG(s_pct) AS avg
             FROM (
-              SELECT ABS(te.fill_price - s.entry_price) / NULLIF(s.entry_price,0) AS s_pct
+              SELECT ABS(te.fill_price - te.requested_price) / NULLIF(te.requested_price,0) AS s_pct
               FROM trade_executions te
-              JOIN signals s ON s.id = te.signal_id
               WHERE te.status IN ('filled', 'closed')
                 AND te.fill_price IS NOT NULL
-                AND s.entry_price IS NOT NULL
+                AND te.requested_price IS NOT NULL
+                AND te.requested_price <> 0
             ) sub
             """
         )
